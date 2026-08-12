@@ -1,0 +1,37 @@
+# Local dev infrastructure for Docent/documind (README §7, Phase 0).
+#
+# The pgvector/pgvector image is stock PostgreSQL with the `vector` extension
+# already compiled in — so `CREATE EXTENSION vector` just works, and Spring AI's
+# `spring.ai.vectorstore.pgvector.initialize-schema=true` finds it available on
+# startup. No manual extension install (unlike the local EDB PostgreSQL).
+#
+# Credentials/DB name below MUST match src/main/resources/application.properties:
+#   spring.datasource.url=jdbc:postgresql://localhost:5432/documind
+#   spring.datasource.username=postgres
+#   spring.datasource.password=postgres
+#
+# NOTE: host port 5432 must be free. If the EDB PostgreSQL 18 is running it owns
+# 5432 — stop it first (or change the left-hand port below and the app's JDBC URL).
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: documind-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: documind
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - documind_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # Waits until the server is actually accepting connections.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d documind"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  documind_pgdata:

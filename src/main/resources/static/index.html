@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Docent — Phase 1 Tester</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: -apple-system, system-ui, sans-serif; max-width: 780px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+    h1 { font-size: 1.4rem; } h2 { font-size: 1.05rem; margin-top: 2rem; }
+    section { border: 1px solid #8883; border-radius: 10px; padding: 1rem 1.25rem; margin: 1rem 0; }
+    input[type=text], input[type=file] { width: 100%; padding: .5rem; margin: .3rem 0 .6rem; box-sizing: border-box; }
+    button { padding: .5rem 1rem; border-radius: 8px; border: 1px solid #8886; cursor: pointer; background: #4f7cff; color: #fff; }
+    button:disabled { opacity: .5; cursor: default; }
+    .muted { color: #8889; font-size: .85rem; }
+    pre { background: #8881; padding: .75rem; border-radius: 8px; overflow:auto; white-space: pre-wrap; word-break: break-word; }
+    .answer { background: #4f7cff18; border-left: 3px solid #4f7cff; padding: .75rem 1rem; border-radius: 6px; }
+    .cite { border-left: 3px solid #22a06b; padding: .4rem .75rem; margin: .5rem 0; background: #22a06b12; border-radius: 6px; font-size: .9rem; }
+    .status-INDEXED { color: #22a06b; } .status-FAILED { color: #e5484d; } .status-PROCESSING { color: #f5a623; }
+  </style>
+</head>
+<body>
+  <h1>Docent — Phase 1 vertical-slice tester</h1>
+  <p class="muted">Upload a PDF, then ask a question. No auth yet — this hits <code>/documents</code> and <code>/chat</code> directly.</p>
+
+  <section>
+    <h2>1 · Upload a PDF</h2>
+    <input type="file" id="file" accept="application/pdf" />
+    <input type="text" id="title" placeholder="Title (optional)" />
+    <button id="uploadBtn">Upload &amp; index</button>
+    <div id="uploadResult"></div>
+  </section>
+
+  <section>
+    <h2>2 · Ask a question</h2>
+    <input type="text" id="question" placeholder="e.g. How many vacation days do we get?" />
+    <button id="askBtn">Ask</button>
+    <span class="muted" id="convo"></span>
+    <div id="answer"></div>
+    <div id="citations"></div>
+  </section>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let conversationId = null;
+
+    async function upload() {
+      const f = $('file').files[0];
+      if (!f) { $('uploadResult').innerHTML = '<p class="muted">Pick a PDF first.</p>'; return; }
+      $('uploadBtn').disabled = true;
+      $('uploadResult').innerHTML = '<p class="muted">Uploading &amp; indexing…</p>';
+      const fd = new FormData();
+      fd.append('file', f);
+      if ($('title').value) fd.append('title', $('title').value);
+      try {
+        const res = await fetch('/documents', { method: 'POST', body: fd });
+        const body = await res.json();
+        if (res.ok) {
+          $('uploadResult').innerHTML =
+            `<p>Status: <b class="status-${body.status}">${body.status}</b> · pages: ${body.pageCount ?? '?'} · <span class="muted">${body.id}</span></p>`;
+        } else {
+          $('uploadResult').innerHTML = `<pre>${res.status}: ${JSON.stringify(body, null, 2)}</pre>`;
+        }
+      } catch (e) {
+        $('uploadResult').innerHTML = `<pre>${e}</pre>`;
+      } finally { $('uploadBtn').disabled = false; }
+    }
+
+    async function ask() {
+      const q = $('question').value.trim();
+      if (!q) return;
+      $('askBtn').disabled = true;
+      $('answer').innerHTML = '<p class="muted">Thinking…</p>';
+      $('citations').innerHTML = '';
+      try {
+        const res = await fetch('/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ question: q, conversationId })
+        });
+        const body = await res.json();
+        if (!res.ok) { $('answer').innerHTML = `<pre>${res.status}: ${JSON.stringify(body, null, 2)}</pre>`; return; }
+        conversationId = body.conversationId;
+        $('convo').textContent = 'conversation: ' + conversationId;
+        $('answer').innerHTML = `<div class="answer">${escapeHtml(body.answer)}</div>`;
+        const cites = body.citations || [];
+        $('citations').innerHTML = cites.length
+          ? '<h3 style="font-size:.9rem">Citations</h3>' + cites.map((c, i) =>
+              `<div class="cite"><b>[${i + 1}] ${escapeHtml(c.documentTitle || '')}</b>${c.pageNumber ? ' · p.' + c.pageNumber : ''}${c.relevanceScore != null ? ' · score ' + c.relevanceScore.toFixed(3) : ''}<br>${escapeHtml(c.snippet || '')}</div>`).join('')
+          : '<p class="muted">No citations (answer was not grounded in any document).</p>';
+      } catch (e) {
+        $('answer').innerHTML = `<pre>${e}</pre>`;
+      } finally { $('askBtn').disabled = false; }
+    }
+
+    function escapeHtml(s) { return (s || '').replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
+
+    $('uploadBtn').addEventListener('click', upload);
+    $('askBtn').addEventListener('click', ask);
+    $('question').addEventListener('keydown', e => { if (e.key === 'Enter') ask(); });
+  </script>
+</body>
+</html>
