@@ -5,10 +5,8 @@ import com.fruity.documind.entity.Conversation;
 import com.fruity.documind.entity.Message;
 import com.fruity.documind.entity.User;
 import com.fruity.documind.enums.MessageRole;
-import com.fruity.documind.enums.Role;
 import com.fruity.documind.repository.ConversationRepository;
 import com.fruity.documind.repository.MessageRepository;
-import com.fruity.documind.repository.UserRepository;
 import com.fruity.documind.service.ChunkRetrievalService.RetrievedChunk;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.UserMessage;
@@ -16,6 +14,7 @@ import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 import java.util.UUID;
@@ -36,8 +35,6 @@ import java.util.UUID;
 @Service
 public class ChatService {
 
-    private static final String DEV_USER_EMAIL = "dev@documind.local"; // temporary; see DocumentService
-
     private static final String SYSTEM_INSTRUCTION = """
             You are Docent, an enterprise knowledge assistant. Answer the user's question using \
             ONLY the information in the provided context. If the answer is not contained in the \
@@ -49,7 +46,6 @@ public class ChatService {
 
     private final ConversationRepository conversationRepository;
     private final MessageRepository messageRepository;
-    private final UserRepository userRepository;
     private final ChunkRetrievalService chunkRetrievalService;
     private final CitationService citationService;
     private final ChatModel chatModel;
@@ -57,14 +53,12 @@ public class ChatService {
 
     public ChatService(ConversationRepository conversationRepository,
                        MessageRepository messageRepository,
-                       UserRepository userRepository,
                        ChunkRetrievalService chunkRetrievalService,
                        CitationService citationService,
                        ChatModel chatModel,
                        @Value("${documind.retrieval.top-k:5}") int topK) {
         this.conversationRepository = conversationRepository;
         this.messageRepository = messageRepository;
-        this.userRepository = userRepository;
         this.chunkRetrievalService = chunkRetrievalService;
         this.citationService = citationService;
         this.chatModel = chatModel;
@@ -75,14 +69,14 @@ public class ChatService {
     public record ChatResult(UUID conversationId, UUID messageId, String answer, List<Citation> citations) {}
 
     /**
-     * Ask a question. {@code conversationId} may be null to start a new conversation.
+     * Ask a question as {@code user}. {@code conversationId} may be null to start a new
+     * conversation. Retrieval is scoped to what {@code user} is authorized to see.
      */
-    public ChatResult ask(String question, UUID conversationId) {
+    public ChatResult ask(String question, UUID conversationId, User user) {
         if (question == null || question.isBlank()) {
             throw new IllegalArgumentException("Question must not be empty");
         }
         String q = question.strip();
-        User user = resolveUser();
         Conversation conversation = resolveConversation(conversationId, user, q);
 
         // 1. Persist the user's turn.
@@ -112,6 +106,17 @@ public class ChatService {
         conversationRepository.save(conversation);
 
         return new ChatResult(conversation.getId(), assistantMessage.getId(), answer, citations);
+    }
+
+    /** Replay a conversation's turns in order — only if it belongs to {@code user}. */
+    @Transactional(readOnly = true)
+    public List<com.fruity.documind.entity.Message> history(UUID conversationId, User user) {
+        Conversation conversation = conversationRepository.findById(conversationId)
+                .orElseThrow(() -> new IllegalArgumentException("Conversation not found: " + conversationId));
+        if (!conversation.getUser().getId().equals(user.getId())) {
+            throw new IllegalArgumentException("Conversation does not belong to this user");
+        }
+        return messageRepository.findByConversationIdOrderByCreatedAtAsc(conversationId);
     }
 
     // --- helpers ---
@@ -157,16 +162,5 @@ public class ChatService {
     private static String deriveTitle(String question) {
         String t = question.strip();
         return t.length() <= 60 ? t : t.substring(0, 57) + "...";
-    }
-
-    private User resolveUser() {
-        return userRepository.findByEmail(DEV_USER_EMAIL).orElseGet(() -> {
-            User dev = new User();
-            dev.setEmail(DEV_USER_EMAIL);
-            dev.setName("Dev User");
-            dev.setPasswordHash("N/A-phase1");
-            dev.setRole(Role.ADMIN);
-            return userRepository.save(dev);
-        });
     }
 }

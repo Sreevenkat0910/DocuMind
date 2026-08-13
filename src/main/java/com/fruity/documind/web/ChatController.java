@@ -1,6 +1,6 @@
 package com.fruity.documind.web;
 
-import com.fruity.documind.repository.MessageRepository;
+import com.fruity.documind.security.CurrentUser;
 import com.fruity.documind.service.ChatService;
 import com.fruity.documind.service.ChatService.ChatResult;
 import com.fruity.documind.web.ChatDtos.ChatRequest;
@@ -22,25 +22,25 @@ import java.util.UUID;
 public class ChatController {
 
     private final ChatService chatService;
-    private final MessageRepository messageRepository;
+    private final CurrentUser currentUser;
 
-    public ChatController(ChatService chatService, MessageRepository messageRepository) {
+    public ChatController(ChatService chatService, CurrentUser currentUser) {
         this.chatService = chatService;
-        this.messageRepository = messageRepository;
+        this.currentUser = currentUser;
     }
 
     /** Ask a question (optionally within an existing conversation). */
     @PostMapping("/chat")
     public ChatResponse ask(@RequestBody ChatRequest request) {
-        ChatResult result = chatService.ask(request.question(), request.conversationId());
+        ChatResult result = chatService.ask(request.question(), request.conversationId(), currentUser.require());
         List<CitationView> citations = result.citations().stream().map(CitationView::from).toList();
         return new ChatResponse(result.conversationId(), result.messageId(), result.answer(), citations);
     }
 
-    /** Replay a conversation's turns in order. */
+    /** Replay a conversation's turns in order (only the caller's own conversations). */
     @GetMapping("/conversations/{id}/messages")
     public List<MessageView> history(@PathVariable UUID id) {
-        return messageRepository.findByConversationIdOrderByCreatedAtAsc(id).stream()
+        return chatService.history(id, currentUser.require()).stream()
                 .map(MessageView::from).toList();
     }
 

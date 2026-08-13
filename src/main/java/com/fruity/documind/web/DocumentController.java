@@ -1,10 +1,12 @@
 package com.fruity.documind.web;
 
 import com.fruity.documind.entity.Document;
+import com.fruity.documind.security.CurrentUser;
 import com.fruity.documind.service.DocumentProcessingException;
 import com.fruity.documind.service.DocumentService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -20,22 +22,27 @@ import java.util.Map;
 public class DocumentController {
 
     private final DocumentService documentService;
+    private final CurrentUser currentUser;
 
-    public DocumentController(DocumentService documentService) {
+    public DocumentController(DocumentService documentService, CurrentUser currentUser) {
         this.documentService = documentService;
+        this.currentUser = currentUser;
     }
 
+    /** Upload a PDF. Restricted to EDITOR/ADMIN — VIEWERs can read but not add documents. */
+    @PreAuthorize("hasAnyRole('EDITOR', 'ADMIN')")
     @PostMapping(consumes = "multipart/form-data")
     public ResponseEntity<DocumentResponse> upload(
             @RequestParam("file") MultipartFile file,
             @RequestParam(value = "title", required = false) String title) {
-        Document document = documentService.upload(file, title);
+        Document document = documentService.upload(file, title, currentUser.require());
         return ResponseEntity.status(HttpStatus.CREATED).body(DocumentResponse.from(document));
     }
 
+    /** List documents the caller is authorized to see. */
     @GetMapping
     public List<DocumentResponse> list() {
-        return documentService.listAll().stream().map(DocumentResponse::from).toList();
+        return documentService.listAccessible(currentUser.require()).stream().map(DocumentResponse::from).toList();
     }
 
     // --- local error handling ---

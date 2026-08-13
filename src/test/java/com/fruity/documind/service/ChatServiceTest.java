@@ -1,13 +1,11 @@
 package com.fruity.documind.service;
 
-import com.fruity.documind.entity.Conversation;
 import com.fruity.documind.entity.Document;
 import com.fruity.documind.entity.DocumentChunk;
 import com.fruity.documind.entity.Message;
 import com.fruity.documind.entity.User;
 import com.fruity.documind.repository.ConversationRepository;
 import com.fruity.documind.repository.MessageRepository;
-import com.fruity.documind.repository.UserRepository;
 import com.fruity.documind.service.ChatService.ChatResult;
 import com.fruity.documind.service.ChunkRetrievalService.RetrievedChunk;
 import org.junit.jupiter.api.BeforeEach;
@@ -19,7 +17,6 @@ import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.chat.prompt.Prompt;
 
 import java.util.List;
-import java.util.Optional;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -31,25 +28,23 @@ class ChatServiceTest {
 
     private ConversationRepository conversationRepository;
     private MessageRepository messageRepository;
-    private UserRepository userRepository;
     private ChunkRetrievalService chunkRetrievalService;
     private CitationService citationService;
     private ChatModel chatModel;
     private ChatService service;
+    private User user;
 
     @BeforeEach
     void setup() {
         conversationRepository = mock(ConversationRepository.class);
         messageRepository = mock(MessageRepository.class);
-        userRepository = mock(UserRepository.class);
         chunkRetrievalService = mock(ChunkRetrievalService.class);
         citationService = mock(CitationService.class);
         chatModel = mock(ChatModel.class);
-        service = new ChatService(conversationRepository, messageRepository, userRepository,
+        service = new ChatService(conversationRepository, messageRepository,
                 chunkRetrievalService, citationService, chatModel, 5);
 
-        User user = new User();
-        when(userRepository.findByEmail(anyString())).thenReturn(Optional.of(user));
+        user = new User();
         when(conversationRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
         when(messageRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
     }
@@ -71,7 +66,7 @@ class ChatServiceTest {
         when(chatModel.call(any(Prompt.class)))
                 .thenReturn(new ChatResponse(List.of(new Generation(new AssistantMessage("You get 20 days [1].")))));
 
-        ChatResult result = service.ask("How much vacation?", null);
+        ChatResult result = service.ask("How much vacation?", null, user);
 
         assertEquals("You get 20 days [1].", result.answer());
         verify(chatModel, times(1)).call(any(Prompt.class));
@@ -83,7 +78,7 @@ class ChatServiceTest {
     void noAuthorizedChunks_skipsLlm_returnsCannedAnswer_noCitations() {
         when(chunkRetrievalService.retrieve(anyString(), any(), anyInt())).thenReturn(List.of());
 
-        ChatResult result = service.ask("Anything secret?", null);
+        ChatResult result = service.ask("Anything secret?", null, user);
 
         assertTrue(result.answer().toLowerCase().contains("couldn't find"));
         verify(chatModel, never()).call(any(Prompt.class));
@@ -93,7 +88,7 @@ class ChatServiceTest {
 
     @Test
     void blankQuestion_isRejected() {
-        assertThrows(IllegalArgumentException.class, () -> service.ask("   ", null));
+        assertThrows(IllegalArgumentException.class, () -> service.ask("   ", null, user));
         verifyNoInteractions(chatModel);
         verify(messageRepository, never()).save(any());
     }
@@ -101,7 +96,7 @@ class ChatServiceTest {
     @Test
     void unknownConversation_isRejected() {
         UUID missing = UUID.randomUUID();
-        when(conversationRepository.findById(missing)).thenReturn(Optional.empty());
-        assertThrows(IllegalArgumentException.class, () -> service.ask("hi", missing));
+        when(conversationRepository.findById(missing)).thenReturn(java.util.Optional.empty());
+        assertThrows(IllegalArgumentException.class, () -> service.ask("hi", missing, user));
     }
 }

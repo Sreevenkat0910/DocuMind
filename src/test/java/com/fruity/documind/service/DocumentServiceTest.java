@@ -5,7 +5,6 @@ import com.fruity.documind.entity.User;
 import com.fruity.documind.enums.DocumentStatus;
 import com.fruity.documind.repository.DocumentPermissionRepository;
 import com.fruity.documind.repository.DocumentRepository;
-import com.fruity.documind.repository.UserRepository;
 import com.fruity.documind.service.ChunkIngestionService.ChunkInput;
 import com.fruity.documind.service.PdfParsingService.ParsedDocument;
 import com.fruity.documind.service.PdfParsingService.ParsedPage;
@@ -16,39 +15,38 @@ import org.springframework.mock.web.MockMultipartFile;
 
 import java.io.IOException;
 import java.util.List;
-import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 
 /** Verifies the upload orchestration (status lifecycle + failure path) with mocked collaborators. */
 class DocumentServiceTest {
 
     private DocumentRepository documentRepository;
-    private UserRepository userRepository;
     private DocumentPermissionRepository documentPermissionRepository;
     private FileStorageService fileStorageService;
     private PdfParsingService pdfParsingService;
     private ChunkingService chunkingService;
     private ChunkIngestionService chunkIngestionService;
     private DocumentService service;
+    private User uploader;
 
     @BeforeEach
     void setup() {
         documentRepository = mock(DocumentRepository.class);
-        userRepository = mock(UserRepository.class);
         documentPermissionRepository = mock(DocumentPermissionRepository.class);
         fileStorageService = mock(FileStorageService.class);
         pdfParsingService = mock(PdfParsingService.class);
         chunkingService = mock(ChunkingService.class);
         chunkIngestionService = mock(ChunkIngestionService.class);
-        service = new DocumentService(documentRepository, userRepository, documentPermissionRepository,
+        service = new DocumentService(documentRepository, documentPermissionRepository,
                 fileStorageService, pdfParsingService, chunkingService, chunkIngestionService);
+        uploader = new User();
 
         // save() returns its argument (the same mutated Document instance) back.
         when(documentRepository.save(any(Document.class))).thenAnswer(inv -> inv.getArgument(0));
-        when(userRepository.findByEmail(anyString())).thenReturn(Optional.of(new User()));
         when(fileStorageService.store(any(), anyString())).thenReturn("/tmp/stored.pdf");
     }
 
@@ -63,7 +61,7 @@ class DocumentServiceTest {
         when(chunkingService.chunk(any()))
                 .thenReturn(List.of(new ChunkInput(0, "a", 1, 1), new ChunkInput(1, "b", 2, 1)));
 
-        Document result = service.upload(pdf(), "My Title");
+        Document result = service.upload(pdf(), "My Title", uploader);
 
         assertEquals(DocumentStatus.INDEXED, result.getStatus());
         assertEquals("My Title", result.getTitle());
@@ -81,7 +79,7 @@ class DocumentServiceTest {
                 .thenReturn(new ParsedDocument(1, List.of(new ParsedPage(1, ""))));
         when(chunkingService.chunk(any())).thenReturn(List.of()); // no extractable text
 
-        Document result = service.upload(pdf(), null);
+        Document result = service.upload(pdf(), null, uploader);
 
         assertEquals(DocumentStatus.INDEXED, result.getStatus());
         verify(chunkIngestionService, never()).ingestChunks(any(), any());
@@ -91,7 +89,7 @@ class DocumentServiceTest {
     void processingFailure_marksFailed_andRethrows() throws Exception {
         when(pdfParsingService.parse(any(byte[].class))).thenThrow(new IOException("corrupt pdf"));
 
-        assertThrows(DocumentProcessingException.class, () -> service.upload(pdf(), null));
+        assertThrows(DocumentProcessingException.class, () -> service.upload(pdf(), null, uploader));
 
         ArgumentCaptor<Document> captor = ArgumentCaptor.forClass(Document.class);
         verify(documentRepository, atLeastOnce()).save(captor.capture());
@@ -103,7 +101,7 @@ class DocumentServiceTest {
     void nonPdf_isRejected_beforeAnyStorageOrPersistence() {
         MockMultipartFile txt = new MockMultipartFile("file", "notes.txt", "text/plain", "hello".getBytes());
 
-        assertThrows(UnsupportedOperationException.class, () -> service.upload(txt, null));
+        assertThrows(UnsupportedOperationException.class, () -> service.upload(txt, null, uploader));
 
         verify(fileStorageService, never()).store(any(), anyString());
         verify(documentRepository, never()).save(any());
@@ -112,6 +110,6 @@ class DocumentServiceTest {
     @Test
     void emptyFile_isRejected() {
         MockMultipartFile empty = new MockMultipartFile("file", "report.pdf", "application/pdf", new byte[0]);
-        assertThrows(IllegalArgumentException.class, () -> service.upload(empty, null));
+        assertThrows(IllegalArgumentException.class, () -> service.upload(empty, null, uploader));
     }
 }

@@ -2,8 +2,11 @@ package com.fruity.documind.service;
 
 import com.fruity.documind.entity.Document;
 import com.fruity.documind.entity.DocumentChunk;
+import com.fruity.documind.entity.User;
 import com.fruity.documind.enums.DocumentStatus;
+import com.fruity.documind.enums.Role;
 import com.fruity.documind.repository.DocumentChunkRepository;
+import com.fruity.documind.repository.UserRepository;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
@@ -39,13 +42,16 @@ class DocumentIngestionIntegrationTest {
     private DocumentChunkRepository chunkRepository;
     @Autowired
     private JdbcTemplate jdbcTemplate;
+    @Autowired
+    private UserRepository userRepository;
 
     @Test
     void upload_runsFullPipeline_persistingChunksAndVectors() throws Exception {
+        User uploader = persistUser();
         MockMultipartFile file = new MockMultipartFile(
                 "file", "integration.pdf", "application/pdf", singlePagePdf());
 
-        Document doc = documentService.upload(file, "Integration Test Doc");
+        Document doc = documentService.upload(file, "Integration Test Doc", uploader);
 
         // 1. Status lifecycle reached INDEXED.
         assertEquals(DocumentStatus.INDEXED, doc.getStatus());
@@ -63,6 +69,15 @@ class DocumentIngestionIntegrationTest {
         assertNotNull(vectorRows);
         assertEquals(chunks.size(), vectorRows,
                 "one vector row should exist per persisted chunk");
+    }
+
+    private User persistUser() {
+        User u = new User();
+        u.setEmail("ingest-" + java.util.UUID.randomUUID() + "@test.local");
+        u.setPasswordHash("x");
+        u.setName("Ingest Tester");
+        u.setRole(Role.VIEWER);
+        return userRepository.save(u);
     }
 
     private byte[] singlePagePdf() throws Exception {

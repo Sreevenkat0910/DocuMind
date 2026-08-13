@@ -6,10 +6,8 @@ import com.fruity.documind.entity.User;
 import com.fruity.documind.enums.AccessLevel;
 import com.fruity.documind.enums.DocumentStatus;
 import com.fruity.documind.enums.FileType;
-import com.fruity.documind.enums.Role;
 import com.fruity.documind.repository.DocumentPermissionRepository;
 import com.fruity.documind.repository.DocumentRepository;
-import com.fruity.documind.repository.UserRepository;
 import com.fruity.documind.service.ChunkIngestionService.ChunkInput;
 import com.fruity.documind.service.PdfParsingService.ParsedDocument;
 import org.slf4j.Logger;
@@ -18,6 +16,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.util.List;
+import java.util.UUID;
 
 /**
  * Phase 1 upload flow (README §7, step 6). Orchestrates: store file → create Document row
@@ -32,15 +31,7 @@ public class DocumentService {
 
     private static final Logger log = LoggerFactory.getLogger(DocumentService.class);
 
-    /**
-     * TEMPORARY Phase-1 scaffolding: with no auth yet, every upload is attributed to a
-     * single dev user (created on first use). Real uploader identity arrives with JWT auth
-     * in Phase 2, at which point this is replaced by the authenticated principal.
-     */
-    private static final String DEV_USER_EMAIL = "dev@documind.local";
-
     private final DocumentRepository documentRepository;
-    private final UserRepository userRepository;
     private final DocumentPermissionRepository documentPermissionRepository;
     private final FileStorageService fileStorageService;
     private final PdfParsingService pdfParsingService;
@@ -48,14 +39,12 @@ public class DocumentService {
     private final ChunkIngestionService chunkIngestionService;
 
     public DocumentService(DocumentRepository documentRepository,
-                           UserRepository userRepository,
                            DocumentPermissionRepository documentPermissionRepository,
                            FileStorageService fileStorageService,
                            PdfParsingService pdfParsingService,
                            ChunkingService chunkingService,
                            ChunkIngestionService chunkIngestionService) {
         this.documentRepository = documentRepository;
-        this.userRepository = userRepository;
         this.documentPermissionRepository = documentPermissionRepository;
         this.fileStorageService = fileStorageService;
         this.pdfParsingService = pdfParsingService;
@@ -63,8 +52,8 @@ public class DocumentService {
         this.chunkIngestionService = chunkIngestionService;
     }
 
-    /** Store, register, and fully process an uploaded PDF. Returns the persisted Document. */
-    public Document upload(MultipartFile file, String title) {
+    /** Store, register, and fully process an uploaded PDF for {@code uploader}. Returns the persisted Document. */
+    public Document upload(MultipartFile file, String title, User uploader) {
         if (file == null || file.isEmpty()) {
             throw new IllegalArgumentException("Uploaded file is empty");
         }
@@ -74,7 +63,6 @@ public class DocumentService {
         }
 
         byte[] bytes = readBytes(file);
-        User uploader = resolveUploader();
 
         // Store first; the path is a required (non-null) Document field.
         String storagePath = fileStorageService.store(bytes, ".pdf");
@@ -125,8 +113,10 @@ public class DocumentService {
         }
     }
 
-    public List<Document> listAll() {
-        return documentRepository.findAll();
+    /** Documents {@code user} is authorized to see (own grants + role-based grants). */
+    public List<Document> listAccessible(User user) {
+        List<UUID> ids = documentPermissionRepository.findAccessibleDocumentIds(user.getId(), user.getRole());
+        return ids.isEmpty() ? List.of() : documentRepository.findAllById(ids);
     }
 
     // --- helpers ---
@@ -138,17 +128,6 @@ public class DocumentService {
         permission.setAccessLevel(AccessLevel.OWNER);
         permission.setGrantedBy(uploader);
         documentPermissionRepository.save(permission);
-    }
-
-    private User resolveUploader() {
-        return userRepository.findByEmail(DEV_USER_EMAIL).orElseGet(() -> {
-            User dev = new User();
-            dev.setEmail(DEV_USER_EMAIL);
-            dev.setName("Dev User");
-            dev.setPasswordHash("N/A-phase1"); // placeholder; real credentials in Phase 2
-            dev.setRole(Role.ADMIN);
-            return userRepository.save(dev);
-        });
     }
 
     private static boolean isPdf(String filename, String contentType) {

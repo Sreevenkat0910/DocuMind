@@ -3,9 +3,12 @@ package com.fruity.documind.service;
 import com.fruity.documind.entity.Citation;
 import com.fruity.documind.entity.Document;
 import com.fruity.documind.entity.Message;
+import com.fruity.documind.entity.User;
 import com.fruity.documind.enums.MessageRole;
+import com.fruity.documind.enums.Role;
 import com.fruity.documind.repository.CitationRepository;
 import com.fruity.documind.repository.MessageRepository;
+import com.fruity.documind.repository.UserRepository;
 import com.fruity.documind.service.ChatService.ChatResult;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
@@ -60,17 +63,21 @@ class ChatIntegrationTest {
     private MessageRepository messageRepository;
     @Autowired
     private CitationRepository citationRepository;
+    @Autowired
+    private UserRepository userRepository;
 
     @Test
     void ask_retrievesAuthorizedChunks_answersAndCites() throws Exception {
+        User user = persistUser();
+
         // Ingest a document (uploader is auto-granted OWNER access).
         MockMultipartFile file = new MockMultipartFile(
                 "file", "policy.pdf", "application/pdf", pdf("Company vacation policy grants 20 days per year."));
-        Document doc = documentService.upload(file, "HR Policy");
+        Document doc = documentService.upload(file, "HR Policy", user);
         assertEquals(com.fruity.documind.enums.DocumentStatus.INDEXED, doc.getStatus());
 
-        // Ask a question.
-        ChatResult result = chatService.ask("How many vacation days do we get?", null);
+        // Ask a question (same authenticated user, so retrieval is authorized).
+        ChatResult result = chatService.ask("How many vacation days do we get?", null, user);
 
         // Answer came from the (stub) LLM, grounded in retrieved chunks.
         assertEquals(STUB_ANSWER, result.answer());
@@ -88,6 +95,15 @@ class ChatIntegrationTest {
         assertFalse(citations.isEmpty());
         assertNotNull(citations.get(0).getChunkContent());
         assertEquals("HR Policy", citations.get(0).getDocument().getTitle());
+    }
+
+    private User persistUser() {
+        User u = new User();
+        u.setEmail("chat-" + java.util.UUID.randomUUID() + "@test.local");
+        u.setPasswordHash("x");
+        u.setName("Chat Tester");
+        u.setRole(Role.VIEWER);
+        return userRepository.save(u);
     }
 
     private byte[] pdf(String text) throws Exception {
