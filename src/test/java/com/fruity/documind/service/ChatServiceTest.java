@@ -4,17 +4,13 @@ import com.fruity.documind.entity.Document;
 import com.fruity.documind.entity.DocumentChunk;
 import com.fruity.documind.entity.Message;
 import com.fruity.documind.entity.User;
+import com.fruity.documind.gateway.GatewayClient;
 import com.fruity.documind.repository.ConversationRepository;
 import com.fruity.documind.repository.MessageRepository;
 import com.fruity.documind.service.ChatService.ChatResult;
 import com.fruity.documind.service.ChunkRetrievalService.RetrievedChunk;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.springframework.ai.chat.messages.AssistantMessage;
-import org.springframework.ai.chat.model.ChatModel;
-import org.springframework.ai.chat.model.ChatResponse;
-import org.springframework.ai.chat.model.Generation;
-import org.springframework.ai.chat.prompt.Prompt;
 
 import java.util.List;
 import java.util.UUID;
@@ -30,7 +26,7 @@ class ChatServiceTest {
     private MessageRepository messageRepository;
     private ChunkRetrievalService chunkRetrievalService;
     private CitationService citationService;
-    private ChatModel chatModel;
+    private GatewayClient gatewayClient;
     private ChatService service;
     private User user;
 
@@ -40,9 +36,9 @@ class ChatServiceTest {
         messageRepository = mock(MessageRepository.class);
         chunkRetrievalService = mock(ChunkRetrievalService.class);
         citationService = mock(CitationService.class);
-        chatModel = mock(ChatModel.class);
+        gatewayClient = mock(GatewayClient.class);
         service = new ChatService(conversationRepository, messageRepository,
-                chunkRetrievalService, citationService, chatModel, 5);
+                chunkRetrievalService, citationService, gatewayClient, 5);
 
         user = new User();
         when(conversationRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
@@ -63,13 +59,12 @@ class ChatServiceTest {
     void grounded_callsLlm_persistsBothTurns_andRecordsCitations() {
         when(chunkRetrievalService.retrieve(anyString(), any(), anyInt()))
                 .thenReturn(List.of(chunk("Handbook", 3, "Vacation is 20 days.")));
-        when(chatModel.call(any(Prompt.class)))
-                .thenReturn(new ChatResponse(List.of(new Generation(new AssistantMessage("You get 20 days [1].")))));
+        when(gatewayClient.generate(anyString(), anyString())).thenReturn("You get 20 days [1].");
 
         ChatResult result = service.ask("How much vacation?", null, user);
 
         assertEquals("You get 20 days [1].", result.answer());
-        verify(chatModel, times(1)).call(any(Prompt.class));
+        verify(gatewayClient, times(1)).generate(anyString(), anyString());
         verify(messageRepository, times(2)).save(any(Message.class)); // USER + ASSISTANT
         verify(citationService, times(1)).recordCitations(any(), anyList());
     }
@@ -81,7 +76,7 @@ class ChatServiceTest {
         ChatResult result = service.ask("Anything secret?", null, user);
 
         assertTrue(result.answer().toLowerCase().contains("couldn't find"));
-        verify(chatModel, never()).call(any(Prompt.class));
+        verify(gatewayClient, never()).generate(anyString(), anyString());
         verify(citationService, never()).recordCitations(any(), anyList());
         verify(messageRepository, times(2)).save(any(Message.class)); // USER + canned ASSISTANT
     }
@@ -89,7 +84,7 @@ class ChatServiceTest {
     @Test
     void blankQuestion_isRejected() {
         assertThrows(IllegalArgumentException.class, () -> service.ask("   ", null, user));
-        verifyNoInteractions(chatModel);
+        verifyNoInteractions(gatewayClient);
         verify(messageRepository, never()).save(any());
     }
 

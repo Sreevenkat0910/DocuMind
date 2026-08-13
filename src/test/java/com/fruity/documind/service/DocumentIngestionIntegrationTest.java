@@ -32,7 +32,9 @@ import static org.junit.jupiter.api.Assertions.*;
  * <p>{@code @Transactional} rolls all writes back, leaving the dev DB clean. A dummy OpenAI
  * key is set only so the (unused-here) Gemini chat bean can construct at context load.
  */
-@SpringBootTest(properties = "spring.ai.openai.api-key=sk-test-not-used")
+@SpringBootTest(properties = {
+        "spring.ai.openai.api-key=sk-test-not-used",
+        "documind.gateway.enabled=false"})
 @Transactional
 class DocumentIngestionIntegrationTest {
 

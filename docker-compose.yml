@@ -33,5 +33,19 @@ services:
       timeout: 5s
       retries: 10
 
+  # Python Embedding & LLM Gateway (Plan.md Phase 3). Text in -> embedding out,
+  # prompt in -> Groq completion out. No DB access, no permissions.
+  # The Java app runs on the host and reaches this at http://localhost:8000.
+  gateway:
+    build: ./gateway
+    container_name: documind-gateway
+    restart: unless-stopped
+    environment:
+      # Shared secret checked on every request; must match the app's INTERNAL_API_KEY.
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?set INTERNAL_API_KEY in .env}
+      GROQ_API_KEY: ${GROQ_API_KEY:?set GROQ_API_KEY in .env}
+    ports:
+      - "8000:8000"
+
 volumes:
   documind_pgdata:

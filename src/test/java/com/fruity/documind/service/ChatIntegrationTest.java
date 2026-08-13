@@ -6,6 +6,7 @@ import com.fruity.documind.entity.Message;
 import com.fruity.documind.entity.User;
 import com.fruity.documind.enums.MessageRole;
 import com.fruity.documind.enums.Role;
+import com.fruity.documind.gateway.GatewayClient;
 import com.fruity.documind.repository.CitationRepository;
 import com.fruity.documind.repository.MessageRepository;
 import com.fruity.documind.repository.UserRepository;
@@ -16,10 +17,6 @@ import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.font.PDType1Font;
 import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
 import org.junit.jupiter.api.Test;
-import org.springframework.ai.chat.messages.AssistantMessage;
-import org.springframework.ai.chat.model.ChatModel;
-import org.springframework.ai.chat.model.ChatResponse;
-import org.springframework.ai.chat.model.Generation;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.context.TestConfiguration;
@@ -38,20 +35,30 @@ import static org.junit.jupiter.api.Assertions.*;
  * (no key) and a stubbed chat model (so no Gemini call/key is needed). Proves: upload →
  * auto-granted OWNER permission → real embedding + retrieval of authorized chunks → LLM
  * answer → USER/ASSISTANT turns and citations persisted. {@code @Transactional} rolls back.
+ *
+ * <p>Gateway is disabled ({@code documind.gateway.enabled=false}) so embeddings use the real
+ * local ONNX model (retrieval must return real chunks); only the LLM {@code /generate} call is
+ * stubbed via a fake {@link GatewayClient}, so no Groq key or running gateway is needed.
  */
-@SpringBootTest(properties = "spring.ai.openai.api-key=sk-test-not-used")
+@SpringBootTest(properties = {
+        "spring.ai.openai.api-key=sk-test-not-used",
+        "documind.gateway.enabled=false"})
 @Transactional
 class ChatIntegrationTest {
 
     private static final String STUB_ANSWER = "Based on the context, the policy is 20 days [1].";
 
-    /** Only the CHAT model is stubbed; embeddings are the real local model. */
     @TestConfiguration
-    static class StubChat {
+    static class StubGateway {
         @Bean
         @Primary
-        ChatModel stubChatModel() {
-            return prompt -> new ChatResponse(List.of(new Generation(new AssistantMessage(STUB_ANSWER))));
+        GatewayClient stubGatewayClient() {
+            return new GatewayClient("http://localhost:0", "") {
+                @Override
+                public String generate(String system, String userMessage) {
+                    return STUB_ANSWER;
+                }
+            };
         }
     }
 

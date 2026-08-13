@@ -7,11 +7,8 @@ import com.fruity.documind.entity.User;
 import com.fruity.documind.enums.MessageRole;
 import com.fruity.documind.repository.ConversationRepository;
 import com.fruity.documind.repository.MessageRepository;
+import com.fruity.documind.gateway.GatewayClient;
 import com.fruity.documind.service.ChunkRetrievalService.RetrievedChunk;
-import org.springframework.ai.chat.messages.SystemMessage;
-import org.springframework.ai.chat.messages.UserMessage;
-import org.springframework.ai.chat.model.ChatModel;
-import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -48,20 +45,20 @@ public class ChatService {
     private final MessageRepository messageRepository;
     private final ChunkRetrievalService chunkRetrievalService;
     private final CitationService citationService;
-    private final ChatModel chatModel;
+    private final GatewayClient gatewayClient;
     private final int topK;
 
     public ChatService(ConversationRepository conversationRepository,
                        MessageRepository messageRepository,
                        ChunkRetrievalService chunkRetrievalService,
                        CitationService citationService,
-                       ChatModel chatModel,
+                       GatewayClient gatewayClient,
                        @Value("${documind.retrieval.top-k:5}") int topK) {
         this.conversationRepository = conversationRepository;
         this.messageRepository = messageRepository;
         this.chunkRetrievalService = chunkRetrievalService;
         this.citationService = citationService;
-        this.chatModel = chatModel;
+        this.gatewayClient = gatewayClient;
         this.topK = topK;
     }
 
@@ -90,10 +87,9 @@ public class ChatService {
         if (chunks.isEmpty()) {
             answer = NO_CONTEXT_ANSWER; // don't invoke the model with no context; avoids hallucination.
         } else {
-            Prompt prompt = new Prompt(List.of(
-                    new SystemMessage(SYSTEM_INSTRUCTION),
-                    new UserMessage(buildContextBlock(chunks) + "\n\nQuestion: " + q)));
-            answer = chatModel.call(prompt).getResult().getOutput().getText();
+            answer = gatewayClient.generate(
+                    SYSTEM_INSTRUCTION,
+                    buildContextBlock(chunks) + "\n\nQuestion: " + q);
         }
 
         // 4. Persist the assistant's turn and record citations for the grounding chunks.
