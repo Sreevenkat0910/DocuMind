@@ -33,6 +33,15 @@ def test_missing_key_is_rejected():
     assert client.post("/embed", json={"text": "x"}).status_code == 401
 
 
+def test_retrieve_empty_allowed_short_circuits():
+    # No allowed docs -> empty results without touching the DB (pool stays closed).
+    r = client.post("/retrieve",
+                    json={"query": "q", "allowed_document_ids": [], "top_k": 5},
+                    headers=KEY)
+    assert r.status_code == 200
+    assert r.json()["results"] == []
+
+
 def test_generate_calls_groq(monkeypatch):
     class Usage:
         def model_dump(self):

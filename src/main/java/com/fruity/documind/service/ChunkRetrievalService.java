@@ -2,17 +2,21 @@ package com.fruity.documind.service;
 
 import com.fruity.documind.entity.DocumentChunk;
 import com.fruity.documind.entity.User;
+import com.fruity.documind.gateway.GatewayClient;
 import com.fruity.documind.repository.DocumentChunkRepository;
 import com.fruity.documind.repository.DocumentPermissionRepository;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -26,20 +30,31 @@ import java.util.stream.Collectors;
  * <em>fresh</em> {@code DocumentPermission} query. That second check is the actual
  * gate: a permission revoked after the pre-filter was computed still blocks the
  * chunk here.
+ *
+ * <p><b>Phase 4:</b> the similarity search itself moves to the Python gateway
+ * ({@code POST /retrieve}) when {@code documind.gateway.enabled=true}; otherwise the
+ * local Spring AI {@link VectorStore} does it in-process. Either way the re-verification
+ * gate below is unchanged — the gateway is trusted to <em>filter</em>, never to <em>authorize</em>.
  */
 @Service
 public class ChunkRetrievalService {
 
     private final VectorStore vectorStore;
+    private final GatewayClient gatewayClient;
     private final DocumentChunkRepository chunkRepository;
     private final DocumentPermissionRepository permissionRepository;
+    private final boolean gatewayEnabled;
 
     public ChunkRetrievalService(VectorStore vectorStore,
+                                 GatewayClient gatewayClient,
                                  DocumentChunkRepository chunkRepository,
-                                 DocumentPermissionRepository permissionRepository) {
+                                 DocumentPermissionRepository permissionRepository,
+                                 @Value("${documind.gateway.enabled:false}") boolean gatewayEnabled) {
         this.vectorStore = vectorStore;
+        this.gatewayClient = gatewayClient;
         this.chunkRepository = chunkRepository;
         this.permissionRepository = permissionRepository;
+        this.gatewayEnabled = gatewayEnabled;
     }
 
     /** A chunk that passed the authorization gate, with its similarity score. */
@@ -58,35 +73,11 @@ public class ChunkRetrievalService {
             return List.of(); // user can see nothing; skip the vector search entirely.
         }
 
-        // --- Step 3: similarity search, pre-filtered by allowed document ids. ---
-        String inList = allowedDocIds.stream()
-                .map(id -> "'" + id + "'")
-                .collect(Collectors.joining(", ", "documentId in [", "]"));
-
-        SearchRequest request = SearchRequest.builder()
-                .query(query)
-                .topK(topK)
-                .filterExpression(inList)
-                .build();
-
-        List<org.springframework.ai.document.Document> hits = vectorStore.similaritySearch(request);
-        if (hits == null || hits.isEmpty()) {
-            return List.of();
-        }
-
-        // --- Step 4a: extract chunkIds in similarity order, preserving scores. ---
-        Map<UUID, Double> scoreByChunkId = new LinkedHashMap<>();
-        for (org.springframework.ai.document.Document hit : hits) {
-            Object raw = hit.getMetadata().get(ChunkIngestionService.META_CHUNK_ID);
-            if (raw == null) {
-                continue; // vector rows written outside our ingestion path have no chunkId.
-            }
-            try {
-                scoreByChunkId.put(UUID.fromString(raw.toString()), hit.getScore());
-            } catch (IllegalArgumentException ignored) {
-                // Malformed metadata: ignore rather than trust it.
-            }
-        }
+        // --- Step 3: similarity search (Python gateway or local VectorStore), pre-filtered
+        //     by the allowed document ids. Returns chunkId -> score in similarity order. ---
+        Map<UUID, Double> scoreByChunkId = gatewayEnabled
+                ? candidatesViaGateway(query, allowedDocIds, topK)
+                : candidatesViaVectorStore(query, allowedDocIds, topK);
         if (scoreByChunkId.isEmpty()) {
             return List.of();
         }
@@ -98,7 +89,7 @@ public class ChunkRetrievalService {
                 .collect(Collectors.toMap(DocumentChunk::getId, c -> c));
 
         // --- Step 4c: RE-VERIFY against a fresh permission query (authoritative gate). ---
-        var allowedNow = new java.util.HashSet<>(
+        Set<UUID> allowedNow = new HashSet<>(
                 permissionRepository.findAccessibleDocumentIds(user.getId(), user.getRole()));
 
         // --- Step 5: assemble in original similarity order, dropping anything unsafe. ---
@@ -114,5 +105,53 @@ public class ChunkRetrievalService {
             result.add(new RetrievedChunk(chunk, entry.getValue()));
         }
         return result;
+    }
+
+    /** Phase 4: vector search delegated to the Python gateway's {@code /retrieve}. */
+    private Map<UUID, Double> candidatesViaGateway(String query, List<UUID> allowedDocIds, int topK) {
+        List<String> allowed = allowedDocIds.stream().map(UUID::toString).toList();
+        Map<UUID, Double> scoreByChunkId = new LinkedHashMap<>();
+        for (GatewayClient.RetrievedRef ref : gatewayClient.retrieve(query, allowed, topK)) {
+            if (ref.chunkId() == null) {
+                continue;
+            }
+            try {
+                scoreByChunkId.put(UUID.fromString(ref.chunkId()), ref.score());
+            } catch (IllegalArgumentException ignored) {
+                // Malformed chunk id from the gateway: ignore rather than trust it.
+            }
+        }
+        return scoreByChunkId;
+    }
+
+    /** Pre-Phase-4 local path: Spring AI {@link VectorStore} does the search in-process. */
+    private Map<UUID, Double> candidatesViaVectorStore(String query, List<UUID> allowedDocIds, int topK) {
+        String inList = allowedDocIds.stream()
+                .map(id -> "'" + id + "'")
+                .collect(Collectors.joining(", ", "documentId in [", "]"));
+
+        SearchRequest request = SearchRequest.builder()
+                .query(query)
+                .topK(topK)
+                .filterExpression(inList)
+                .build();
+
+        List<org.springframework.ai.document.Document> hits = vectorStore.similaritySearch(request);
+        Map<UUID, Double> scoreByChunkId = new LinkedHashMap<>();
+        if (hits == null) {
+            return scoreByChunkId;
+        }
+        for (org.springframework.ai.document.Document hit : hits) {
+            Object raw = hit.getMetadata().get(ChunkIngestionService.META_CHUNK_ID);
+            if (raw == null) {
+                continue; // vector rows written outside our ingestion path have no chunkId.
+            }
+            try {
+                scoreByChunkId.put(UUID.fromString(raw.toString()), hit.getScore());
+            } catch (IllegalArgumentException ignored) {
+                // Malformed metadata: ignore rather than trust it.
+            }
+        }
+        return scoreByChunkId;
     }
 }

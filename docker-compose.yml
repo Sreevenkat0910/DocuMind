@@ -44,6 +44,11 @@ services:
       # Shared secret checked on every request; must match the app's INTERNAL_API_KEY.
       INTERNAL_API_KEY: ${INTERNAL_API_KEY:?set INTERNAL_API_KEY in .env}
       GROQ_API_KEY: ${GROQ_API_KEY:?set GROQ_API_KEY in .env}
+      # Phase 4: /retrieve queries pgvector directly (postgres is the compose service name).
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/documind
+    depends_on:
+      postgres:
+        condition: service_healthy
     ports:
       - "8000:8000"
 

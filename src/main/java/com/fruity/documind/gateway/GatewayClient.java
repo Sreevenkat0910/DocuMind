@@ -1,5 +1,6 @@
 package com.fruity.documind.gateway;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Component;
@@ -59,5 +60,31 @@ public class GatewayClient {
                 .retrieve()
                 .body(EmbedBatchResponse.class);
         return resp == null ? List.of() : resp.embeddings();
+    }
+
+    private record RetrieveRequest(String query,
+                                   @JsonProperty("allowed_document_ids") List<String> allowedDocumentIds,
+                                   @JsonProperty("top_k") int topK) {}
+
+    /** One similarity hit from the gateway. Java re-verifies the chunk id before trusting it. */
+    public record RetrievedRef(@JsonProperty("chunk_id") String chunkId,
+                               @JsonProperty("document_id") String documentId,
+                               double score) {}
+
+    private record RetrieveResponse(List<RetrievedRef> results) {}
+
+    /**
+     * Phase 4: filtered vector search in Python. {@code allowedDocumentIds} is the pre-filter
+     * Java already computed; the returned chunk ids are still re-verified by the caller.
+     */
+    public List<RetrievedRef> retrieve(String query, List<String> allowedDocumentIds, int topK) {
+        RetrieveResponse resp = rest.post()
+                .uri("/retrieve")
+                .header("X-Internal-Api-Key", apiKey)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(new RetrieveRequest(query, allowedDocumentIds, topK))
+                .retrieve()
+                .body(RetrieveResponse.class);
+        return resp == null ? List.of() : resp.results();
     }
 }

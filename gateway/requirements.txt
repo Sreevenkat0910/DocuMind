@@ -3,5 +3,6 @@ uvicorn[standard]
 sentence-transformers
 groq
 pydantic
+psycopg[binary,pool]
 httpx
 pytest
