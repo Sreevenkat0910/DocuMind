@@ -19,6 +19,7 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.*;
 
 /** Verifies the upload orchestration (status lifecycle + failure path) with mocked collaborators. */
@@ -77,7 +78,8 @@ class DocumentServiceTest {
     void scannedPdf_zeroChunks_stillIndexed_butSkipsIngest() throws Exception {
         when(pdfParsingService.parse(any(byte[].class)))
                 .thenReturn(new ParsedDocument(1, List.of(new ParsedPage(1, ""))));
-        when(gatewayClient.chunk(any())).thenReturn(List.of()); // no extractable text
+        when(gatewayClient.parse(any(byte[].class), anyString())).thenReturn(List.of()); // OCR also finds nothing
+        when(gatewayClient.chunk(any())).thenReturn(List.of());
 
         Document result = service.upload(pdf(), null, uploader);
 
@@ -86,8 +88,58 @@ class DocumentServiceTest {
     }
 
     @Test
+    void scannedPdf_fallsBackToGatewayOcr_andIndexesTheResult() throws Exception {
+        // PDFBox finds no text (scanned/image-only) -> gateway OCR is tried, and DOES find text.
+        when(pdfParsingService.parse(any(byte[].class)))
+                .thenReturn(new ParsedDocument(1, List.of(new ParsedPage(1, ""))));
+        when(gatewayClient.parse(any(byte[].class), eq("report.pdf")))
+                .thenReturn(List.of(new GatewayClient.ParsedPage(1, "ocr'd text")));
+        when(gatewayClient.chunk(any()))
+                .thenReturn(List.of(new GatewayClient.ChunkOutput("ocr'd text", 1)));
+
+        Document result = service.upload(pdf(), null, uploader);
+
+        assertEquals(DocumentStatus.INDEXED, result.getStatus());
+        assertEquals(1, result.getPageCount());
+        verify(chunkIngestionService, times(1)).ingestChunks(any(), any());
+    }
+
+    @Test
+    void docxUpload_skipsPdfBox_goesStraightToGatewayParse() throws Exception {
+        MockMultipartFile docx = new MockMultipartFile("file", "report.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "fake docx".getBytes());
+        when(gatewayClient.parse(any(byte[].class), eq("report.docx")))
+                .thenReturn(List.of(new GatewayClient.ParsedPage(1, "docx text")));
+        when(gatewayClient.chunk(any()))
+                .thenReturn(List.of(new GatewayClient.ChunkOutput("docx text", 1)));
+
+        Document result = service.upload(docx, null, uploader);
+
+        assertEquals(DocumentStatus.INDEXED, result.getStatus());
+        verify(pdfParsingService, never()).parse(any(byte[].class));
+        verify(chunkIngestionService, times(1)).ingestChunks(any(), any());
+    }
+
+    @Test
     void processingFailure_marksFailed_andRethrows() throws Exception {
         when(pdfParsingService.parse(any(byte[].class))).thenThrow(new IOException("corrupt pdf"));
+
+        assertThrows(DocumentProcessingException.class, () -> service.upload(pdf(), null, uploader));
+
+        ArgumentCaptor<Document> captor = ArgumentCaptor.forClass(Document.class);
+        verify(documentRepository, atLeastOnce()).save(captor.capture());
+        assertEquals(DocumentStatus.FAILED, captor.getValue().getStatus());
+        verify(chunkIngestionService, never()).ingestChunks(any(), any());
+    }
+
+    @Test
+    void gatewayUnavailable_marksFailed_documentNotSilentlyLost() throws Exception {
+        // Plan.md Phase 10 exit criteria: ingestion fails loudly and recoverably (durable FAILED
+        // status) rather than silently losing the document when the gateway is down.
+        when(pdfParsingService.parse(any(byte[].class)))
+                .thenReturn(new ParsedDocument(1, List.of(new ParsedPage(1, "some real extracted text"))));
+        when(gatewayClient.chunk(any()))
+                .thenThrow(new GatewayClient.GatewayUnavailableException("/chunk", new RuntimeException("connection refused")));
 
         assertThrows(DocumentProcessingException.class, () -> service.upload(pdf(), null, uploader));
 

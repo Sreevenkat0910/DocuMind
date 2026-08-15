@@ -157,7 +157,10 @@ Implement Phase 10 from Plan.md: full multi-container docker-compose (Java, Pyth
 ```
 Verify Phase 10 exit criteria: the system survives the Python service restarting mid-conversation, and ingestion fails loudly and recoverably (durable FAILED status) instead of silently losing a document. Show me the resilience test.
 ```
-
+Remaining work:
+- docker-compose.yml: add the app (Java) and redis services, a gateway healthcheck, and wire app's env vars (SPRING_DATASOURCE_URL, DOCUMIND_GATEWAY_URL, DOCUMIND_STORAGE_LOCATION, JWT_SECRET, INTERNAL_API_KEY) plus a storage volume — Dockerfile and .dockerignore are already written.
+- GitHub Actions CI: create .github/workflows/ci.yml — checkout, JDK 21 + Python setup, docker compose up -d --wait postgres gateway with job-level dummy env vars, ./mvnw test, then pytest against the same Postgres container.
+- Verify end-to-end: bring up the full compose stack, confirm the app container serves traffic through Postgres/gateway, then demonstrate the two Phase 10 exit criteria (kill/restart the gateway mid-conversation and confirm chat degrades gracefully instead of crashing; force a gateway-down ingestion and confirm the document lands in FAILED, not silently lost).
 ---
 
 ## Anytime prompts (use as needed between phases)

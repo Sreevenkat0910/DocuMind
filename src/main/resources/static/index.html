@@ -24,8 +24,8 @@
   <p class="muted">Upload a PDF, then ask a question. No auth yet — this hits <code>/documents</code> and <code>/chat</code> directly.</p>
 
   <section>
-    <h2>1 · Upload a PDF</h2>
-    <input type="file" id="file" accept="application/pdf" />
+    <h2>1 · Upload a document</h2>
+    <input type="file" id="file" accept=".pdf,.docx,.xlsx,.pptx" />
     <input type="text" id="title" placeholder="Title (optional)" />
     <button id="uploadBtn">Upload &amp; index</button>
     <div id="uploadResult"></div>
@@ -66,28 +66,53 @@
       } finally { $('uploadBtn').disabled = false; }
     }
 
+    // Phase 8: streamed via /chat/stream. Not EventSource (it can't POST a JSON body) — read
+    // the response body as a stream instead and parse the "event: name\ndata: ...\n\n" blocks
+    // ourselves. `token` events carry raw text (append as it arrives); the one final `metadata`
+    // event carries JSON (conversationId/citations) — citations only exist once generation ends.
     async function ask() {
       const q = $('question').value.trim();
       if (!q) return;
       $('askBtn').disabled = true;
-      $('answer').innerHTML = '<p class="muted">Thinking…</p>';
+      $('answer').innerHTML = '<div class="answer" id="liveAnswer"></div>';
       $('citations').innerHTML = '';
+      let answerText = '';
       try {
-        const res = await fetch('/chat', {
+        const res = await fetch('/chat/stream', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ question: q, conversationId })
         });
-        const body = await res.json();
-        if (!res.ok) { $('answer').innerHTML = `<pre>${res.status}: ${JSON.stringify(body, null, 2)}</pre>`; return; }
-        conversationId = body.conversationId;
-        $('convo').textContent = 'conversation: ' + conversationId;
-        $('answer').innerHTML = `<div class="answer">${escapeHtml(body.answer)}</div>`;
-        const cites = body.citations || [];
-        $('citations').innerHTML = cites.length
-          ? '<h3 style="font-size:.9rem">Citations</h3>' + cites.map((c, i) =>
-              `<div class="cite"><b>[${i + 1}] ${escapeHtml(c.documentTitle || '')}</b>${c.pageNumber ? ' · p.' + c.pageNumber : ''}${c.relevanceScore != null ? ' · score ' + c.relevanceScore.toFixed(3) : ''}<br>${escapeHtml(c.snippet || '')}</div>`).join('')
-          : '<p class="muted">No citations (answer was not grounded in any document).</p>';
+        if (!res.ok) { $('answer').innerHTML = `<pre>${res.status}: ${await res.text()}</pre>`; return; }
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          let sep;
+          while ((sep = buf.indexOf('\n\n')) >= 0) {
+            const block = buf.slice(0, sep);
+            buf = buf.slice(sep + 2);
+            const eventType = (block.match(/^event:\s*(.*)$/m) || [, 'message'])[1].trim();
+            const data = (block.match(/^data:\s*(.*)$/m) || [, ''])[1];
+            if (eventType === 'token') {
+              answerText += data; // raw text, appears incrementally
+              $('liveAnswer').textContent = answerText;
+            } else if (eventType === 'metadata') {
+              const body = JSON.parse(data);
+              conversationId = body.conversationId;
+              $('convo').textContent = 'conversation: ' + conversationId;
+              const cites = body.citations || [];
+              $('citations').innerHTML = cites.length // arrives once the stream closes
+                ? '<h3 style="font-size:.9rem">Citations</h3>' + cites.map((c, i) =>
+                    `<div class="cite"><b>[${i + 1}] ${escapeHtml(c.documentTitle || '')}</b>${c.pageNumber ? ' · p.' + c.pageNumber : ''}${c.relevanceScore != null ? ' · score ' + c.relevanceScore.toFixed(3) : ''}<br>${escapeHtml(c.snippet || '')}</div>`).join('')
+                : '<p class="muted">No citations (answer was not grounded in any document).</p>';
+            }
+          }
+        }
       } catch (e) {
         $('answer').innerHTML = `<pre>${e}</pre>`;
       } finally { $('askBtn').disabled = false; }

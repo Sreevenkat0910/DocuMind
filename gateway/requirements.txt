@@ -7,3 +7,10 @@ pydantic
 psycopg[binary,pool]
 httpx
 pytest
+python-multipart
+pytesseract
+PyMuPDF
+Pillow
+python-docx
+openpyxl
+python-pptx

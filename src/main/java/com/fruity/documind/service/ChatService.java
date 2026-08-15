@@ -38,6 +38,12 @@ public class ChatService {
     private static final String NO_CONTEXT_ANSWER =
             "I couldn't find anything in your documents to answer that.";
 
+    /** Plan.md Phase 10: shown when the gateway is down (retries exhausted / circuit open)
+     *  instead of a 500 or a raw exception. There is no in-process fallback answer — Phase 5.5
+     *  moved all AI/vector logic to Python, so Java has nothing left to answer with locally. */
+    private static final String SERVICE_UNAVAILABLE_ANSWER =
+            "The AI assistant is temporarily unavailable. Please try again in a moment.";
+
     private final ConversationRepository conversationRepository;
     private final MessageRepository messageRepository;
     private final ChunkRetrievalService chunkRetrievalService;
@@ -84,9 +90,17 @@ public class ChatService {
             answer = NO_CONTEXT_ANSWER; // user can see nothing; skip the gateway round-trip.
             verifiedChunks = List.of();
         } else {
-            GatewayClient.RagResult rag = gatewayClient.ragQuery(
-                    q, allowedDocIds.stream().map(UUID::toString).toList(), topK);
-            if (rag.noContextFound()) {
+            GatewayClient.RagResult rag;
+            try {
+                rag = gatewayClient.ragQuery(
+                        q, allowedDocIds.stream().map(UUID::toString).toList(), topK);
+            } catch (GatewayClient.UncheckedGatewayException e) {
+                rag = null; // Phase 10: gateway is down; answer clearly instead of a 500.
+            }
+            if (rag == null) {
+                answer = SERVICE_UNAVAILABLE_ANSWER;
+                verifiedChunks = List.of();
+            } else if (rag.noContextFound()) {
                 answer = NO_CONTEXT_ANSWER; // no chunks grounded the answer; Python skipped the LLM.
                 verifiedChunks = List.of();
             } else {
@@ -105,6 +119,61 @@ public class ChatService {
                 : citationService.recordCitations(assistantMessage, verifiedChunks);
 
         // Touch the conversation so it sorts to the top of the sidebar.
+        conversationRepository.save(conversation);
+
+        return new ChatResult(conversation.getId(), assistantMessage.getId(), answer, citations);
+    }
+
+    /**
+     * Phase 8: streaming variant of {@link #ask}. Same orchestration shell (persist USER turn
+     * -> compute allowedDocumentIds -> stream from the gateway -> RE-VERIFY every cited chunk
+     * id -> persist ASSISTANT turn -> citations) — kept as a parallel method rather than a
+     * refactor of {@code ask()}, since that one is tested and working and this shape (an
+     * incremental token callback instead of one blocking return) is different enough that
+     * forcing them through one method would cost more clarity than the duplication does.
+     *
+     * @param onToken invoked with each token as it streams in, so the caller (the controller,
+     *                which owns the {@code SseEmitter}) can relay it to the client immediately.
+     */
+    public ChatResult askStreaming(String question, UUID conversationId, User user, java.util.function.Consumer<String> onToken) {
+        if (question == null || question.isBlank()) {
+            throw new IllegalArgumentException("Question must not be empty");
+        }
+        String q = question.strip();
+        Conversation conversation = resolveConversation(conversationId, user, q);
+        saveMessage(conversation, MessageRole.USER, q);
+
+        List<UUID> allowedDocIds = chunkRetrievalService.accessibleDocumentIds(user);
+        StringBuilder accumulated = new StringBuilder();
+        List<RetrievedChunk> verifiedChunks;
+        if (allowedDocIds.isEmpty()) {
+            accumulated.append(NO_CONTEXT_ANSWER);
+            verifiedChunks = List.of();
+        } else {
+            GatewayClient.StreamOutcome outcome;
+            try {
+                outcome = gatewayClient.streamRagQuery(
+                        q, allowedDocIds.stream().map(UUID::toString).toList(), topK,
+                        token -> { accumulated.append(token); onToken.accept(token); });
+            } catch (GatewayClient.UncheckedGatewayException e) {
+                outcome = null; // Phase 10: gateway is down; answer clearly instead of a 500.
+            }
+            if (outcome == null) {
+                accumulated.append(SERVICE_UNAVAILABLE_ANSWER);
+                verifiedChunks = List.of();
+            } else if (outcome.noContextFound()) {
+                accumulated.append(NO_CONTEXT_ANSWER);
+                verifiedChunks = List.of();
+            } else {
+                verifiedChunks = chunkRetrievalService.verify(parseChunkIds(outcome.usedChunkIds()), user);
+            }
+        }
+
+        String answer = accumulated.toString();
+        Message assistantMessage = saveMessage(conversation, MessageRole.ASSISTANT, answer);
+        List<Citation> citations = verifiedChunks.isEmpty()
+                ? List.of()
+                : citationService.recordCitations(assistantMessage, verifiedChunks);
         conversationRepository.save(conversation);
 
         return new ChatResult(conversation.getId(), assistantMessage.getId(), answer, citations);

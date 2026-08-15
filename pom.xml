@@ -58,6 +58,28 @@
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-starter-webmvc</artifactId>
 		</dependency>
+		<!-- Phase 10: retry + circuit-breaker around the Java -> Python gateway calls. Needs AOP
+		     (proxy-based method interception) to weave the @Retry/@CircuitBreaker annotations.
+		     Spring Boot 4 dropped the "starter-aop" convenience artifact; spring-aop itself is
+		     already transitively present (via spring-context), so aspectjweaver is all that's
+		     missing — version comes from the parent BOM. -->
+		<dependency>
+			<groupId>org.aspectj</groupId>
+			<artifactId>aspectjweaver</artifactId>
+		</dependency>
+		<dependency>
+			<groupId>io.github.resilience4j</groupId>
+			<artifactId>resilience4j-spring-boot3</artifactId>
+			<version>2.3.0</version>
+		</dependency>
+		<!-- Phase 8: GatewayClient's raw JDK HttpClient streaming call needs ObjectMapper/JsonNode
+		     directly (bypassing RestClient's auto-configured Jackson converters). Only jackson-
+		     annotations (a much smaller artifact, for @JsonProperty) was transitively present
+		     before; jackson-databind needs to be explicit. Version comes from Spring Boot's BOM. -->
+		<dependency>
+			<groupId>com.fasterxml.jackson.core</groupId>
+			<artifactId>jackson-databind</artifactId>
+		</dependency>
 		<!-- PDF text extraction (Phase 1 parsing). Not managed by Spring Boot BOM, so pin a version. -->
 		<dependency>
 			<groupId>org.apache.pdfbox</groupId>

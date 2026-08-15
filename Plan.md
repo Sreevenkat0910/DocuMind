@@ -205,6 +205,7 @@ Each phase below is designed to be buildable and demo-able **on its own**, with 
 
 **Exit criteria:** The tester UI shows tokens appearing incrementally, with citations arriving once the stream closes.
 
+
 ---
 
 ### Phase 9 — OCR & multi-format ingestion (your existing roadmap Phase 7, now natural in Python)

@@ -1,0 +1,7 @@
+target/
+storage/
+.git/
+.env
+.env.local
+gateway/
+*.log

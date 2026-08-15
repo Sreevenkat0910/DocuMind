@@ -1,17 +1,15 @@
-# Local dev infrastructure for Docent/documind (README §7, Phase 0).
+# Full multi-container stack for Docent/documind (Plan.md Phase 10): Postgres+pgvector, the
+# Python gateway, the Java app, and Redis. `docker compose up -d` alone now runs the whole
+# system — no more "run the Java app on the host separately."
 #
-# The pgvector/pgvector image is stock PostgreSQL with the `vector` extension
-# already compiled in — so `CREATE EXTENSION vector` just works, and Spring AI's
-# `spring.ai.vectorstore.pgvector.initialize-schema=true` finds it available on
-# startup. No manual extension install (unlike the local EDB PostgreSQL).
+# The pgvector/pgvector image is stock PostgreSQL with the `vector` extension already compiled
+# in, so `CREATE EXTENSION vector` just works on startup. No manual extension install (unlike
+# the local EDB PostgreSQL).
 #
-# Credentials/DB name below MUST match src/main/resources/application.properties:
-#   spring.datasource.url=jdbc:postgresql://localhost:5432/documind
-#   spring.datasource.username=postgres
-#   spring.datasource.password=postgres
+# NOTE: host ports 5432/8000/8080 must be free. If a local PostgreSQL is running it owns 5432 —
+# stop it first (or change the left-hand port below and SPRING_DATASOURCE_URL).
 #
-# NOTE: host port 5432 must be free. If the EDB PostgreSQL 18 is running it owns
-# 5432 — stop it first (or change the left-hand port below and the app's JDBC URL).
+# `.env` (git-ignored, see .env.example) must define INTERNAL_API_KEY, GROQ_API_KEY, JWT_SECRET.
 
 services:
   postgres:

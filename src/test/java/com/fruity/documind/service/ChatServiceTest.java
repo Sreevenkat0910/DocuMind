@@ -99,6 +99,20 @@ class ChatServiceTest {
     }
 
     @Test
+    void gatewayUnavailable_returnsClearMessage_notAnException_noCitations() {
+        when(chunkRetrievalService.accessibleDocumentIds(any())).thenReturn(List.of(UUID.randomUUID()));
+        when(gatewayClient.ragQuery(anyString(), anyList(), anyInt()))
+                .thenThrow(new GatewayClient.GatewayUnavailableException("/rag/query", new RuntimeException("connection refused")));
+
+        ChatResult result = service.ask("Anything?", null, user);
+
+        assertTrue(result.answer().toLowerCase().contains("unavailable"));
+        verify(chunkRetrievalService, never()).verify(anyList(), any());
+        verify(citationService, never()).recordCitations(any(), anyList());
+        verify(messageRepository, times(2)).save(any(Message.class)); // USER + degraded ASSISTANT
+    }
+
+    @Test
     void blankQuestion_isRejected() {
         assertThrows(IllegalArgumentException.class, () -> service.ask("   ", null, user));
         verifyNoInteractions(gatewayClient);

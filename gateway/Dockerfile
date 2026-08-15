@@ -1,6 +1,10 @@
 FROM python:3.12-slim
 WORKDIR /app
 
+# tesseract-ocr: the actual OCR engine pytesseract shells out to (Plan.md Phase 9).
+RUN apt-get update && apt-get install -y --no-install-recommends tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 

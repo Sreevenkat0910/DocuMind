@@ -4,11 +4,17 @@ Smallest possible first cut of the Python service: text in -> embedding vector o
 and prompt in -> LLM completion out. No vector store, no retrieval, no permissions —
 Java still owns all of that. Every route requires the shared internal API key.
 """
+import json
+import logging
+import io
 import os
 import re
+import time
+import uuid
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response, UploadFile
+from fastapi.responses import StreamingResponse
 from groq import Groq
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from psycopg.types.json import Json
@@ -47,6 +53,27 @@ _groq = Groq(api_key=os.getenv("GROQ_API_KEY") or "gsk-not-set")
 # Opened lazily on the first DB use so importing this module (tests, /embed-only use)
 # needs no database.
 _pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=4, open=False)
+
+# --- Phase 7: structured, per-stage tracing. One JSON line per stage, always carrying the
+# correlation id Java propagated (CorrelationIdFilter -> GatewayClient -> X-Correlation-Id
+# header) — `grep <id>` across both services' logs shows one request's full timing story. No
+# Langfuse/external tracing service: no account exists for this project, and stdlib logging
+# already satisfies the actual exit criterion (see one trace, see where the latency went).
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+_log = logging.getLogger("documind.gateway")
+
+
+def log_stage(correlation_id: str, stage: str, duration_ms: float, **extra):
+    """Emit one structured JSON log line for a named pipeline stage (retrieve / rerank / llm)."""
+    payload = {"correlation_id": correlation_id, "stage": stage, "duration_ms": round(duration_ms, 1)}
+    payload.update(extra)
+    _log.info(json.dumps(payload))
+
+
+def correlation_id_dep(x_correlation_id: str | None = Header(default=None)) -> str:
+    """Reuse the caller's correlation id if it sent one (the normal case — Java always does),
+    otherwise mint one so direct/manual calls still get a traceable id."""
+    return x_correlation_id or str(uuid.uuid4())
 
 
 def _ensure_schema():
@@ -279,12 +306,16 @@ def rerank(query: str, candidates: list[dict], top_k: int) -> list[dict]:
     return [{**c, "score": float(s)} for c, s in ranked[:top_k]]
 
 
-def hybrid_retrieve(query: str, allowed_document_ids: list[str], top_k: int) -> list[dict]:
+def hybrid_retrieve(query: str, allowed_document_ids: list[str], top_k: int,
+                     correlation_id: str = "-") -> list[dict]:
     """Vector ANN + Postgres full-text search (top ~20 each) -> RRF fusion -> CrossEncoder
     rerank -> top_k. Returns hits as {chunk_id, document_id, content, score} dicts, `score`
-    being the CrossEncoder's relevance score (not a similarity/distance metric any more)."""
+    being the CrossEncoder's relevance score (not a similarity/distance metric any more).
+    Logs the "retrieve" (search + fusion) and "rerank" stages (Plan.md Phase 7)."""
     if not allowed_document_ids:
         return []
+
+    t0 = time.monotonic()
     vec = "[" + ",".join(map(str, _embedder.encode(query).tolist())) + "]"
     _pool.open()  # idempotent; establishes the pool on first use
     with _pool.connection() as conn:
@@ -297,12 +328,20 @@ def hybrid_retrieve(query: str, allowed_document_ids: list[str], top_k: int) -> 
             {"q": query, "docs": allowed_document_ids, "n": CANDIDATE_POOL},
         ).fetchall()
     fused = rrf_fuse([_row_to_hit(r) for r in vector_rows], [_row_to_hit(r) for r in lexical_rows])
-    return rerank(query, fused, top_k)
+    log_stage(correlation_id, "retrieve", (time.monotonic() - t0) * 1000,
+              vector_candidates=len(vector_rows), lexical_candidates=len(lexical_rows))
+
+    t1 = time.monotonic()
+    reranked = rerank(query, fused, top_k)
+    log_stage(correlation_id, "rerank", (time.monotonic() - t1) * 1000,
+              candidates_in=len(fused), results_out=len(reranked))
+    return reranked
 
 
 @app.post("/retrieve", response_model=RetrieveResponse, dependencies=[Depends(require_key)])
-def retrieve(req: RetrieveRequest):
-    hits = hybrid_retrieve(req.query, req.allowed_document_ids, req.top_k)
+def retrieve(req: RetrieveRequest, response: Response, correlation_id: str = Depends(correlation_id_dep)):
+    response.headers["X-Correlation-Id"] = correlation_id
+    hits = hybrid_retrieve(req.query, req.allowed_document_ids, req.top_k, correlation_id)
     return RetrieveResponse(results=[
         RetrieveResult(chunk_id=h["chunk_id"], document_id=h["document_id"], score=h["score"])
         for h in hits
@@ -336,10 +375,15 @@ def cited_chunk_ids(answer: str, chunk_ids: list[str]) -> list[str]:
 
 
 @app.post("/rag/query", response_model=RagQueryResponse, dependencies=[Depends(require_key)])
-def rag_query(req: RagQueryRequest):
-    hits = hybrid_retrieve(req.question, req.allowed_document_ids, req.top_k)
+def rag_query(req: RagQueryRequest, response: Response, correlation_id: str = Depends(correlation_id_dep)):
+    response.headers["X-Correlation-Id"] = correlation_id
+    request_start = time.monotonic()
+
+    hits = hybrid_retrieve(req.question, req.allowed_document_ids, req.top_k, correlation_id)
     if not hits:
         # Same hallucination guard as before: no context -> don't call the LLM.
+        log_stage(correlation_id, "rag_query_total", (time.monotonic() - request_start) * 1000,
+                  no_context_found=True)
         return RagQueryResponse(answer="", used_chunk_ids=[], no_context_found=True)
 
     chunk_ids = [h["chunk_id"] for h in hits]
@@ -349,15 +393,80 @@ def rag_query(req: RagQueryRequest):
     context = "Context:\n" + "\n\n".join(f"[{i + 1}] {h['content']}" for i, h in enumerate(hits))
     user_message = context + "\n\nQuestion: " + req.question
 
+    t_llm = time.monotonic()
     resp = _groq.chat.completions.create(model=GROQ_MODEL, messages=[
         {"role": "system", "content": SYSTEM_INSTRUCTION},
         {"role": "user", "content": user_message},
     ])
+    log_stage(correlation_id, "llm", (time.monotonic() - t_llm) * 1000, model=GROQ_MODEL)
+
     answer = resp.choices[0].message.content or ""
+    log_stage(correlation_id, "rag_query_total", (time.monotonic() - request_start) * 1000,
+              no_context_found=False)
     return RagQueryResponse(
         answer=answer,
         used_chunk_ids=cited_chunk_ids(answer, chunk_ids),
         no_context_found=False,
+    )
+
+
+# --- Phase 8: same RAG assembly, but streamed token-by-token. Citations/used_chunk_ids only
+# exist once generation finishes, so the stream always ends with one structured "metadata"
+# event — Java (and any client) treats that as the signal the answer is complete and citable.
+
+def _sse(payload: dict) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _stream_rag_query(question: str, allowed_document_ids: list[str], top_k: int, correlation_id: str):
+    request_start = time.monotonic()
+    hits = hybrid_retrieve(question, allowed_document_ids, top_k, correlation_id)
+    if not hits:
+        # Same hallucination guard as /rag/query: no context -> don't call the LLM.
+        log_stage(correlation_id, "rag_query_stream_total", (time.monotonic() - request_start) * 1000,
+                  no_context_found=True)
+        yield _sse({"type": "metadata", "used_chunk_ids": [], "no_context_found": True})
+        return
+
+    chunk_ids = [h["chunk_id"] for h in hits]
+    context = "Context:\n" + "\n\n".join(f"[{i + 1}] {h['content']}" for i, h in enumerate(hits))
+    user_message = context + "\n\nQuestion: " + question
+
+    t_llm = time.monotonic()
+    first_token_ms = None
+    full_answer = []
+    stream = _groq.chat.completions.create(model=GROQ_MODEL, stream=True, messages=[
+        {"role": "system", "content": SYSTEM_INSTRUCTION},
+        {"role": "user", "content": user_message},
+    ])
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content if chunk.choices else None
+        if not delta:
+            continue
+        if first_token_ms is None:
+            first_token_ms = (time.monotonic() - t_llm) * 1000
+        full_answer.append(delta)
+        yield _sse({"type": "token", "content": delta})
+
+    log_stage(correlation_id, "llm", (time.monotonic() - t_llm) * 1000, model=GROQ_MODEL,
+              time_to_first_token_ms=round(first_token_ms, 1) if first_token_ms is not None else None)
+
+    answer = "".join(full_answer)
+    log_stage(correlation_id, "rag_query_stream_total", (time.monotonic() - request_start) * 1000,
+              no_context_found=False)
+    yield _sse({
+        "type": "metadata",
+        "used_chunk_ids": cited_chunk_ids(answer, chunk_ids),
+        "no_context_found": False,
+    })
+
+
+@app.post("/rag/query/stream", dependencies=[Depends(require_key)])
+def rag_query_stream(req: RagQueryRequest, response: Response, correlation_id: str = Depends(correlation_id_dep)):
+    response.headers["X-Correlation-Id"] = correlation_id
+    return StreamingResponse(
+        _stream_rag_query(req.question, req.allowed_document_ids, req.top_k, correlation_id),
+        media_type="text/event-stream",
     )
 
 
@@ -402,3 +511,79 @@ def index(req: IndexRequest):
                 "embedding": "[" + ",".join(map(str, vec.tolist())) + "]",
             })
     return IndexResponse(indexed=len(req.chunks))
+
+
+# --- Phase 9: OCR + multi-format parsing. Java's PDFBox handles normal PDFs directly (fast, no
+# network); this endpoint is only for what PDFBox can't do — scanned/image PDFs (OCR) and
+# DOCX/XLSX/PPTX. Response shape mirrors Java's PdfParsingService.ParsedDocument exactly
+# ({page_count, pages:[{page_number,text}]}), so DocumentService's downstream chunking pipeline
+# doesn't need to know or care which parser produced the pages.
+
+class ParsePage(BaseModel):
+    page_number: int
+    text: str
+
+
+class ParseResponse(BaseModel):
+    page_count: int
+    pages: list[ParsePage]
+
+
+def _parse_docx(data: bytes) -> ParseResponse:
+    # ponytail: DOCX has no native page concept — the whole document is one logical "page".
+    # Real pagination would need a layout engine (page size, margins, fonts); not worth it here.
+    from docx import Document as DocxDocument
+    doc = DocxDocument(io.BytesIO(data))
+    text = "\n".join(p.text for p in doc.paragraphs if p.text)
+    return ParseResponse(page_count=1, pages=[ParsePage(page_number=1, text=text)])
+
+
+def _parse_xlsx(data: bytes) -> ParseResponse:
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(data), data_only=True, read_only=True)
+    pages = []
+    for i, sheet in enumerate(wb.worksheets, start=1):
+        rows = [" ".join(str(c) for c in row if c is not None)
+                for row in sheet.iter_rows(values_only=True)]
+        pages.append(ParsePage(page_number=i, text="\n".join(r for r in rows if r)))
+    return ParseResponse(page_count=len(pages), pages=pages)
+
+
+def _parse_pptx(data: bytes) -> ParseResponse:
+    from pptx import Presentation
+    prs = Presentation(io.BytesIO(data))
+    pages = []
+    for i, slide in enumerate(prs.slides, start=1):
+        texts = [shape.text_frame.text for shape in slide.shapes
+                 if shape.has_text_frame and shape.text_frame.text]
+        pages.append(ParsePage(page_number=i, text="\n".join(texts)))
+    return ParseResponse(page_count=len(pages), pages=pages)
+
+
+def _parse_pdf_ocr(data: bytes) -> ParseResponse:
+    """OCR fallback for scanned/image-only PDFs (Java already tried PDFBox and got nothing)."""
+    import fitz  # PyMuPDF: rasterize each page, no external binary needed for this half
+    import pytesseract
+    from PIL import Image
+    pages = []
+    with fitz.open(stream=data, filetype="pdf") as pdf:
+        for i, page in enumerate(pdf, start=1):
+            pix = page.get_pixmap(dpi=200)
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            pages.append(ParsePage(page_number=i, text=pytesseract.image_to_string(img)))
+    return ParseResponse(page_count=len(pages), pages=pages)
+
+
+_PARSERS = {
+    "docx": _parse_docx, "xlsx": _parse_xlsx, "pptx": _parse_pptx, "pdf": _parse_pdf_ocr,
+}
+
+
+@app.post("/parse", response_model=ParseResponse, dependencies=[Depends(require_key)])
+async def parse_document(file: UploadFile):
+    ext = (file.filename or "").rsplit(".", 1)[-1].lower()
+    parser = _PARSERS.get(ext)
+    if parser is None:
+        raise HTTPException(status_code=422, detail=f"Unsupported format: .{ext}")
+    data = await file.read()
+    return parser(data)
