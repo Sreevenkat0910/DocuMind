@@ -2,43 +2,37 @@ package com.fruity.documind.service;
 
 import com.fruity.documind.entity.Document;
 import com.fruity.documind.entity.DocumentChunk;
+import com.fruity.documind.gateway.GatewayClient;
 import com.fruity.documind.repository.DocumentChunkRepository;
-import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 
 /**
  * Write path (README §5.3, step 3).
  *
- * For each produced chunk we persist a {@link DocumentChunk} row (the source of
- * truth) and then hand the text to Spring AI's {@link VectorStore} for embedding
- * + similarity-search storage. The vector-store row carries only {chunkId,
- * documentId} metadata, used later purely as a retrieval pre-filter — never as an
- * authorization decision.
+ * For each produced chunk we persist a {@link DocumentChunk} row (the source of truth) and then
+ * hand {@code {chunk_id, document_id, content}} to the Python gateway's {@code POST /index}
+ * (Plan.md Phase 5.5), which embeds the text and writes the vector-store row. The vector row
+ * carries only {chunkId, documentId} metadata, used later purely as a retrieval pre-filter —
+ * never as an authorization decision. Java owns no embedding/vector code any more.
  *
- * <p><b>Atomicity caveat:</b> both writes run inside one {@code @Transactional}
- * method, but Spring AI's pgvector store issues its own JDBC writes that may not
- * enlist in the same Spring-managed transaction. If a crash lands between the JPA
- * commit and the vector-store write, we can get an orphaned chunk (row exists, no
- * embedding). Accepted as an eventual-consistency risk for now; the delete/cleanup
+ * <p><b>Atomicity caveat:</b> the JPA chunk writes run inside this {@code @Transactional} method,
+ * but the gateway's vector write commits out-of-band on its own connection. A crash between the
+ * JPA commit and the {@code /index} call can leave a chunk with no embedding; the delete/cleanup
  * path is responsible for reconciling orphans. See README §5.3.
  */
 @Service
 public class ChunkIngestionService {
 
-    static final String META_CHUNK_ID = "chunkId";
-    static final String META_DOCUMENT_ID = "documentId";
-
     private final DocumentChunkRepository chunkRepository;
-    private final VectorStore vectorStore;
+    private final GatewayClient gatewayClient;
 
-    public ChunkIngestionService(DocumentChunkRepository chunkRepository, VectorStore vectorStore) {
+    public ChunkIngestionService(DocumentChunkRepository chunkRepository, GatewayClient gatewayClient) {
         this.chunkRepository = chunkRepository;
-        this.vectorStore = vectorStore;
+        this.gatewayClient = gatewayClient;
     }
 
     /** One text unit produced by the parsing/chunking step, prior to persistence. */
@@ -59,16 +53,14 @@ public class ChunkIngestionService {
         }
         chunks = chunkRepository.saveAll(chunks);
 
-        // 2. Store embeddings in the vector store, tagging each with its chunkId so
-        //    the read path can map a similarity hit back to the authoritative row.
-        List<org.springframework.ai.document.Document> aiDocs = new ArrayList<>(chunks.size());
+        // 2. Hand the chunks to the gateway to embed + write the vector rows, tagging each with
+        //    its chunkId so the read path can map a similarity hit back to the authoritative row.
+        List<GatewayClient.IndexChunk> toIndex = new ArrayList<>(chunks.size());
         for (DocumentChunk chunk : chunks) {
-            Map<String, Object> metadata = Map.of(
-                    META_CHUNK_ID, chunk.getId().toString(),
-                    META_DOCUMENT_ID, document.getId().toString());
-            aiDocs.add(new org.springframework.ai.document.Document(chunk.getContent(), metadata));
+            toIndex.add(new GatewayClient.IndexChunk(
+                    chunk.getId().toString(), document.getId().toString(), chunk.getContent()));
         }
-        vectorStore.add(aiDocs);
+        gatewayClient.index(toIndex);
 
         return chunks;
     }

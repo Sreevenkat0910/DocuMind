@@ -11,7 +11,6 @@ import com.fruity.documind.repository.DocumentPermissionRepository;
 import com.fruity.documind.service.ChunkRetrievalService.RetrievedChunk;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.springframework.ai.vectorstore.VectorStore;
 
 import java.util.List;
 import java.util.UUID;
@@ -42,9 +41,8 @@ class ChunkRetrievalServiceTest {
         gatewayClient = mock(GatewayClient.class);
         chunkRepository = mock(DocumentChunkRepository.class);
         permissionRepository = mock(DocumentPermissionRepository.class);
-        // gateway ENABLED so retrieval goes through /retrieve; the VectorStore is unused here.
-        service = new ChunkRetrievalService(mock(VectorStore.class), gatewayClient,
-                chunkRepository, permissionRepository, true);
+        // Retrieval always goes through the gateway now (Phase 5.5 removed the in-process path).
+        service = new ChunkRetrievalService(gatewayClient, chunkRepository, permissionRepository);
 
         user = new User();
         user.setRole(Role.VIEWER);
@@ -83,5 +81,42 @@ class ChunkRetrievalServiceTest {
 
         assertTrue(out.isEmpty(),
                 "a revoked document's chunk must not surface even when retrieval happened in Python");
+    }
+
+    /**
+     * Phase 5 re-verification: given used_chunk_ids straight from the (untrusted) Python
+     * /rag/query response, {@code verify} keeps only ids that are both real AND currently
+     * authorized — a forged id and an unauthorized doc's chunk are both dropped.
+     */
+    @Test
+    void verify_keepsAuthorized_dropsForgedAndUnauthorized() {
+        UUID forgedId = UUID.randomUUID();          // no such chunk exists
+        UUID unauthDocId = UUID.randomUUID();
+        UUID unauthChunkId = UUID.randomUUID();
+
+        Document authDoc = mock(Document.class);
+        when(authDoc.getId()).thenReturn(docId);
+        DocumentChunk authChunk = mock(DocumentChunk.class);
+        when(authChunk.getId()).thenReturn(chunkId);
+        when(authChunk.getDocument()).thenReturn(authDoc);
+
+        Document unauthDoc = mock(Document.class);
+        when(unauthDoc.getId()).thenReturn(unauthDocId);
+        DocumentChunk unauthChunk = mock(DocumentChunk.class);
+        when(unauthChunk.getId()).thenReturn(unauthChunkId);
+        when(unauthChunk.getDocument()).thenReturn(unauthDoc);
+
+        // Repo resolves the two real ids; the forged id resolves to nothing.
+        when(chunkRepository.findAllByIdInWithDocument(anyList()))
+                .thenReturn(List.of(authChunk, unauthChunk));
+        // The user is authorized for docId only, never unauthDocId.
+        when(permissionRepository.findAccessibleDocumentIds(any(), any()))
+                .thenReturn(List.of(docId));
+
+        List<RetrievedChunk> out = service.verify(List.of(chunkId, forgedId, unauthChunkId), user);
+
+        assertEquals(1, out.size(), "only the real, authorized chunk id survives re-verification");
+        assertEquals(chunkId, out.get(0).chunk().getId());
+        assertNull(out.get(0).score(), "used_chunk_ids carry no similarity score");
     }
 }

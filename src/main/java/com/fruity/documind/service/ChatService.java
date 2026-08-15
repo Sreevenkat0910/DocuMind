@@ -13,30 +13,27 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
 /**
- * Phase 1 chat/query flow (README §7, step 7). Answers a question strictly from the user's
- * authorized documents:
+ * Chat/query flow (README §7, step 7). Answers a question strictly from the user's authorized
+ * documents. <b>Phase 5:</b> the RAG assembly (retrieve → grounded prompt → LLM → cited sources)
+ * now lives in the Python gateway ({@code POST /rag/query}); this service is a thin orchestrator:
  * <ol>
  *   <li>persist the USER turn,</li>
- *   <li>retrieve authorized chunks via {@link ChunkRetrievalService} (RBAC-enforced),</li>
- *   <li>build a grounded prompt and call the LLM,</li>
- *   <li>persist the ASSISTANT turn, then record {@link Citation}s for the chunks used.</li>
+ *   <li>compute {@code allowedDocumentIds} and call {@code /rag/query},</li>
+ *   <li><b>re-verify</b> every returned {@code used_chunk_id} against a fresh permission query —
+ *       the gateway is trusted to filter, never to authorize,</li>
+ *   <li>persist the ASSISTANT turn, then record {@link Citation}s for the re-verified chunks.</li>
  * </ol>
  *
- * <p>Not {@code @Transactional}: the LLM call is a network round-trip and must not hold a DB
- * transaction open. Each persistence step commits on its own (acceptable Phase-1 trade-off).
+ * <p>Not {@code @Transactional}: the gateway call is a network round-trip and must not hold a DB
+ * transaction open. Each persistence step commits on its own (acceptable trade-off).
  */
 @Service
 public class ChatService {
-
-    private static final String SYSTEM_INSTRUCTION = """
-            You are Docent, an enterprise knowledge assistant. Answer the user's question using \
-            ONLY the information in the provided context. If the answer is not contained in the \
-            context, say you don't have enough information to answer — do not use outside knowledge \
-            and do not guess. Be concise, and refer to the bracketed source numbers (e.g. [1]) you used.""";
 
     private static final String NO_CONTEXT_ANSWER =
             "I couldn't find anything in your documents to answer that.";
@@ -79,24 +76,33 @@ public class ChatService {
         // 1. Persist the user's turn.
         saveMessage(conversation, MessageRole.USER, q);
 
-        // 2. Retrieve authorized chunks (RBAC enforced inside the retrieval service).
-        List<RetrievedChunk> chunks = chunkRetrievalService.retrieve(q, user, topK);
-
-        // 3. Build a grounded prompt and call the LLM — unless there's nothing to ground on.
+        // 2. Compute the allowed-document pre-filter, then let Python assemble the answer.
+        List<UUID> allowedDocIds = chunkRetrievalService.accessibleDocumentIds(user);
         String answer;
-        if (chunks.isEmpty()) {
-            answer = NO_CONTEXT_ANSWER; // don't invoke the model with no context; avoids hallucination.
+        List<RetrievedChunk> verifiedChunks;
+        if (allowedDocIds.isEmpty()) {
+            answer = NO_CONTEXT_ANSWER; // user can see nothing; skip the gateway round-trip.
+            verifiedChunks = List.of();
         } else {
-            answer = gatewayClient.generate(
-                    SYSTEM_INSTRUCTION,
-                    buildContextBlock(chunks) + "\n\nQuestion: " + q);
+            GatewayClient.RagResult rag = gatewayClient.ragQuery(
+                    q, allowedDocIds.stream().map(UUID::toString).toList(), topK);
+            if (rag.noContextFound()) {
+                answer = NO_CONTEXT_ANSWER; // no chunks grounded the answer; Python skipped the LLM.
+                verifiedChunks = List.of();
+            } else {
+                answer = rag.answer();
+                // 3. RE-VERIFY every cited chunk id against a fresh permission query. Forged,
+                //    unknown or newly-unauthorized ids are dropped here — Python is never trusted
+                //    to authorize, only to filter (Plan.md Phase 5 exit criteria).
+                verifiedChunks = chunkRetrievalService.verify(parseChunkIds(rag.usedChunkIds()), user);
+            }
         }
 
-        // 4. Persist the assistant's turn and record citations for the grounding chunks.
+        // 4. Persist the assistant's turn and record citations for the re-verified chunks.
         Message assistantMessage = saveMessage(conversation, MessageRole.ASSISTANT, answer);
-        List<Citation> citations = chunks.isEmpty()
+        List<Citation> citations = verifiedChunks.isEmpty()
                 ? List.of()
-                : citationService.recordCitations(assistantMessage, chunks);
+                : citationService.recordCitations(assistantMessage, verifiedChunks);
 
         // Touch the conversation so it sorts to the top of the sidebar.
         conversationRepository.save(conversation);
@@ -117,19 +123,17 @@ public class ChatService {
 
     // --- helpers ---
 
-    private String buildContextBlock(List<RetrievedChunk> chunks) {
-        StringBuilder sb = new StringBuilder("Context:\n");
-        int n = 1;
-        for (RetrievedChunk rc : chunks) {
-            String title = rc.chunk().getDocument().getTitle();
-            Integer page = rc.chunk().getPageNumber();
-            sb.append('[').append(n++).append("] (").append(title);
-            if (page != null) {
-                sb.append(", p.").append(page);
+    /** Parse the gateway's used-chunk-id strings into UUIDs, silently dropping any malformed one. */
+    private static List<UUID> parseChunkIds(List<String> ids) {
+        List<UUID> parsed = new ArrayList<>(ids.size());
+        for (String id : ids) {
+            try {
+                parsed.add(UUID.fromString(id));
+            } catch (IllegalArgumentException ignored) {
+                // Malformed id from the gateway: ignore rather than trust it.
             }
-            sb.append(")\n").append(rc.chunk().getContent()).append("\n\n");
         }
-        return sb.toString().stripTrailing();
+        return parsed;
     }
 
     private Conversation resolveConversation(UUID conversationId, User user, String firstQuestion) {

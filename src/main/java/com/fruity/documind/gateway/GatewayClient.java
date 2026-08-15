@@ -3,9 +3,11 @@ package com.fruity.documind.gateway;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.MediaType;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.stereotype.Component;
 import org.springframework.web.client.RestClient;
 
+import java.net.http.HttpClient;
 import java.util.List;
 
 /**
@@ -24,42 +26,65 @@ public class GatewayClient {
 
     public GatewayClient(@Value("${documind.gateway.base-url:http://localhost:8000}") String baseUrl,
                          @Value("${documind.gateway.api-key:}") String apiKey) {
-        this.rest = RestClient.builder().baseUrl(baseUrl).build();
+        // Pin HTTP/1.1: the JDK HttpClient otherwise tries an h2c (HTTP/2 cleartext) upgrade that
+        // the gateway's uvicorn/httptools can't handle, which intermittently drops the request body.
+        HttpClient http = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
+        this.rest = RestClient.builder()
+                .baseUrl(baseUrl)
+                .requestFactory(new JdkClientHttpRequestFactory(http))
+                .build();
         this.apiKey = apiKey;
     }
 
-    public record Message(String role, String content) {}
+    /** One chunk to embed + store in the vector index. */
+    public record IndexChunk(@JsonProperty("chunk_id") String chunkId,
+                             @JsonProperty("document_id") String documentId,
+                             String content) {}
 
-    private record GenerateRequest(String system, List<Message> messages) {}
+    private record IndexRequest(List<IndexChunk> chunks) {}
 
-    private record GenerateResponse(String content, String model, Object usage) {}
+    private record IndexResponse(int indexed) {}
 
-    /** Single grounded completion: system instruction + one user turn -> answer text. */
-    public String generate(String system, String userMessage) {
-        GenerateResponse resp = rest.post()
-                .uri("/generate")
+    /**
+     * Phase 5.5: hand the chunks to Python to embed and write into the vector store. Java has
+     * already persisted the authoritative {@code DocumentChunk} rows (its system of record); this
+     * only populates the vector index. Returns how many rows the gateway wrote.
+     */
+    public int index(List<IndexChunk> chunks) {
+        IndexResponse resp = rest.post()
+                .uri("/index")
                 .header("X-Internal-Api-Key", apiKey)
                 .contentType(MediaType.APPLICATION_JSON)
-                .body(new GenerateRequest(system, List.of(new Message("user", userMessage))))
+                .body(new IndexRequest(chunks))
                 .retrieve()
-                .body(GenerateResponse.class);
-        return resp == null ? null : resp.content();
+                .body(IndexResponse.class);
+        return resp == null ? 0 : resp.indexed();
     }
 
-    private record EmbedBatchRequest(List<String> texts) {}
+    /** One page of extracted text to split into chunks. */
+    public record PageInput(@JsonProperty("page_number") int pageNumber, String text) {}
 
-    private record EmbedBatchResponse(List<float[]> embeddings, String model, int dim) {}
+    /** One structure-aware chunk Python produced from a page. Java assigns the chunk id (JPA). */
+    public record ChunkOutput(String content, @JsonProperty("page_number") int pageNumber) {}
 
-    /** Batch-embed texts (used by chunk ingestion and query embedding). Order matches input. */
-    public List<float[]> embedBatch(List<String> texts) {
-        EmbedBatchResponse resp = rest.post()
-                .uri("/embed/batch")
+    private record ChunkRequest(List<PageInput> pages) {}
+
+    private record ChunkResponse(List<ChunkOutput> chunks) {}
+
+    /**
+     * Phase 6: structure-aware splitting lives in Python now (LangChain's
+     * {@code RecursiveCharacterTextSplitter}, per page so {@code pageNumber} stays exact for
+     * citations). Java still assigns chunk ids by persisting the returned chunks via JPA.
+     */
+    public List<ChunkOutput> chunk(List<PageInput> pages) {
+        ChunkResponse resp = rest.post()
+                .uri("/chunk")
                 .header("X-Internal-Api-Key", apiKey)
                 .contentType(MediaType.APPLICATION_JSON)
-                .body(new EmbedBatchRequest(texts))
+                .body(new ChunkRequest(pages))
                 .retrieve()
-                .body(EmbedBatchResponse.class);
-        return resp == null ? List.of() : resp.embeddings();
+                .body(ChunkResponse.class);
+        return resp == null ? List.of() : resp.chunks();
     }
 
     private record RetrieveRequest(String query,
@@ -86,5 +111,39 @@ public class GatewayClient {
                 .retrieve()
                 .body(RetrieveResponse.class);
         return resp == null ? List.of() : resp.results();
+    }
+
+    private record RagQueryRequest(String question,
+                                   @JsonProperty("allowed_document_ids") List<String> allowedDocumentIds,
+                                   @JsonProperty("top_k") int topK) {}
+
+    private record RagQueryResponse(String answer,
+                                    @JsonProperty("used_chunk_ids") List<String> usedChunkIds,
+                                    @JsonProperty("no_context_found") boolean noContextFound) {}
+
+    /**
+     * The finished answer plus which chunk ids the model cited. Java RE-VERIFIES every id in
+     * {@code usedChunkIds} against a fresh permission query before trusting any of them.
+     */
+    public record RagResult(String answer, List<String> usedChunkIds, boolean noContextFound) {}
+
+    /**
+     * Phase 5: full RAG assembly in Python. Java sends the question + its already-computed
+     * {@code allowedDocumentIds}; Python retrieves, builds the grounded prompt, calls the LLM
+     * and returns the answer with the chunk ids it cited. Never an authorization decision.
+     */
+    public RagResult ragQuery(String question, List<String> allowedDocumentIds, int topK) {
+        RagQueryResponse resp = rest.post()
+                .uri("/rag/query")
+                .header("X-Internal-Api-Key", apiKey)
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(new RagQueryRequest(question, allowedDocumentIds, topK))
+                .retrieve()
+                .body(RagQueryResponse.class);
+        if (resp == null) {
+            return new RagResult("", List.of(), true);
+        }
+        List<String> used = resp.usedChunkIds() == null ? List.of() : resp.usedChunkIds();
+        return new RagResult(resp.answer(), used, resp.noContextFound());
     }
 }

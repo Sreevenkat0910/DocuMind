@@ -40,10 +40,10 @@ A plain LLM will confidently answer questions using its training data — which 
 |---|---|---|
 | **Language / runtime** | Java 21 | Uses records, text blocks, modern APIs. |
 | **Framework** | Spring Boot 4.1 | Web MVC, dependency injection, config, actuator. |
-| **AI orchestration** | Spring AI 2.0 | `ChatModel`, `VectorStore`, embedding model abstractions. |
-| **LLM (chat)** | Groq — `llama-3.3-70b-versatile` | Called via Groq's **OpenAI-compatible** endpoint, so the OpenAI starter is reused with a different base URL. |
-| **Embeddings** | Local ONNX `all-MiniLM-L6-v2` (384-dim) | Runs **in-process** via `spring-ai-starter-model-transformers` — no API key, no network after the model is cached. Chosen because Groq has no embeddings API. |
-| **Vector store** | PostgreSQL + **pgvector** (HNSW index, cosine distance) | Similarity search over the 384-dim embeddings. Spring AI owns and auto-creates the `vector_store` table. |
+| **AI engine** | Python **FastAPI** gateway | Owns ALL AI/vector work — embeddings, vector search, LLM, RAG assembly, and the `vector_store` table. Java has **no** Spring AI dependency (removed in Phase 5.5). |
+| **LLM (chat)** | Groq — `llama-3.3-70b-versatile` | Called from the Python gateway (`groq` SDK). |
+| **Embeddings** | `sentence-transformers/all-MiniLM-L6-v2` (384-dim) | Runs in the Python gateway. No API key; the model is cached in the container image. |
+| **Vector store** | PostgreSQL + **pgvector** (HNSW index, cosine distance) | Similarity search over the 384-dim embeddings. The **Python gateway** creates and owns the `vector_store` table (`POST /index` writes it). |
 | **Relational DB** | PostgreSQL 16 | Source of truth for documents, chunks, users, permissions, conversations, citations. |
 | **Persistence** | Spring Data JPA / Hibernate | `ddl-auto=update` — entities are the schema source of truth. |
 | **PDF parsing** | Apache PDFBox 3.0.3 | Page-by-page text extraction (preserves page numbers for citations). |
@@ -127,6 +127,17 @@ Step by step (`ChatService.ask`):
 4. **Prompt & call**: otherwise, build a prompt = a strict system instruction (*answer only from context, cite the bracketed source numbers, don't guess*) + a numbered context block of the retrieved chunks + the question, and call the Groq `ChatModel`.
 5. **Persist the assistant turn** and record a `Citation` for each grounding chunk (snapshotting the chunk text, document, page, and relevance score).
 6. Return the answer + citations to the client.
+
+### Retrieval quality: the Phase 6 A/B eval
+
+Phase 6 replaced plain vector search with **hybrid search + reranking**, all in the Python gateway: vector ANN + Postgres full-text search (top ~20 each) → Reciprocal Rank Fusion → CrossEncoder reranking → top `k`. To *show* the improvement rather than assert it, `gateway/eval/` holds a 15-question eval set against 8 hand-built documents, deliberately constructed as **three "confusable families"** — near-duplicate phrasing, different facts (e.g. `zephyr`/`solandra`/`kestrelmoor` are all "Protocol X was ratified in year Y by author Z, governs W-lattice sync across N provinces", just with different years/names/topics). About half the questions paraphrase the source text instead of echoing its vocabulary, so the eval can't be won by lexical luck alone.
+
+| Method | Precision@1 | Hit@3 |
+|---|---|---|
+| Baseline — plain vector ANN (Phase 4/5) | 14/15 (93%) | 15/15 (100%) |
+| **Phase 6 — hybrid + RRF + rerank** | **15/15 (100%)** | 15/15 (100%) |
+
+The one baseline miss is the real story: *"Which agreement governs magneto-lattice resonance in the eastern provinces?"* (expects `kestrelmoor`) — plain cosine similarity's top-1 pick was `zephyr`, a structurally near-identical sibling document. Hybrid search's full-text signal plus the CrossEncoder (which reads the actual query↔chunk text pair, not two averaged embeddings) resolved the ambiguity correctly. On a small, clean corpus with one chunk per topic this is the kind of gap that shows up — reproduce it with `docker exec documind-gateway python eval_phase6.py` (see `gateway/eval_phase6.py`'s docstring to re-upload the corpus first).
 
 ---
 
@@ -257,7 +268,7 @@ erDiagram
     }
 ```
 
-**Plus one table you won't find as a JPA entity:** `vector_store`, created and owned by Spring AI's pgvector integration. It holds the embedding vectors and a JSONB metadata column (`{chunkId, documentId}`). It is used *only* as a retrieval index/pre-filter — never for authorization.
+**Plus one table you won't find as a JPA entity:** `vector_store`, created and owned by the **Python gateway** (which creates the table + HNSW index on startup and writes it via `POST /index`). It holds the embedding vectors and a JSONB metadata column (`{chunkId, documentId}`). It is used *only* as a retrieval index/pre-filter — never for authorization.
 
 **Enums:**
 - `Role`: `ADMIN`, `EDITOR`, `VIEWER`
@@ -275,14 +286,32 @@ erDiagram
 
 ## The security model
 
-Retrieval is written the way it is for one reason: **the vector store must never be the authorization decision.** Here's the defense-in-depth in `ChunkRetrievalService`:
+Retrieval is written the way it is for one reason: **the vector store must never be the authorization decision.** As of Phases 4–5 the similarity search and the full RAG assembly run in the Python gateway, but the authorization gate stays entirely in Java. The defense-in-depth:
 
-1. **Pre-filter** — compute the set of document IDs the user may access (`DocumentPermissionRepository.findAccessibleDocumentIds`, which unions user-specific grants and role grants). If empty, skip the vector search entirely.
-2. **Filtered similarity search** — run the pgvector search with a `documentId in [...]` filter. This is a *speed* optimization, not the security gate.
-3. **Re-fetch authoritative rows** — map each vector hit back to its real `DocumentChunk` via the `chunkId` metadata.
-4. **Re-verify** — run the permission query **again, fresh**, and drop any chunk whose document is no longer allowed. This means a permission revoked *after* the pre-filter was computed still blocks the chunk. Malformed metadata, orphaned vectors, and rows written outside the ingestion path are all silently discarded rather than trusted.
+1. **Pre-filter (Java)** — compute the set of document IDs the user may access (`DocumentPermissionRepository.findAccessibleDocumentIds`, which unions user-specific grants and role grants). If empty, skip the gateway call entirely.
+2. **Filtered search / RAG (Python)** — the gateway runs the pgvector search (`/retrieve`) or the whole grounded-answer assembly (`/rag/query`), scoped to those `allowed_document_ids`. This is a *speed* optimization and a courtesy filter — **not** the security gate.
+3. **Re-fetch authoritative rows (Java)** — map every `chunk_id` the gateway returns back to its real `DocumentChunk` (`ChunkRetrievalService.verify`).
+4. **Re-verify (Java)** — run the permission query **again, fresh**, and drop any chunk whose document is no longer allowed. A permission revoked *after* the pre-filter still blocks the chunk; forged, malformed, or orphaned chunk IDs are silently discarded rather than trusted.
 
-> Because there's no auth yet (Phase 1), every request is attributed to a single dev user (`dev@documind.local`, `ADMIN`) created on first use. Real JWT authentication and RBAC enforcement replace the `SecurityConfig` permit-all stub in Phase 2 — the retrieval gate above is already built to enforce it.
+**The rule, stated plainly:**
+
+> **Python never queries `document_permissions` and never should.** It receives `allowed_document_ids` already computed by Java, and is trusted only to *filter*, never to *authorize*. **Java re-verifies every `chunk_id`** the gateway returns against a fresh permission query before it is cited or shown. A compromised or buggy gateway therefore cannot leak a chunk the user isn't currently allowed to see — the worst it can do is return IDs that Java drops. (Proven by `ChatIntegrationTest.ask_reVerification_rejectsForgedAndMalformedChunkIds`.)
+
+Authentication is real as of Phase 2: a JWT (HS256) is issued on login and validated on every request; roles are `VIEWER < EDITOR < ADMIN`, enforced with method-level `@PreAuthorize` (e.g. only `EDITOR`/`ADMIN` may upload documents).
+
+### Java ⇄ Python gateway contract
+
+The Java app is the system of record and the RBAC authority; the Python gateway (FastAPI) is the embedding + vector-storage + retrieval + LLM engine. Every request carries the shared `X-Internal-Api-Key`; all calls are Java → Python. Java has no AI/vector code and no Spring AI dependency. Current endpoints:
+
+| Endpoint | Since | Purpose |
+|---|---|---|
+| `POST /embed`, `POST /embed/batch` | Phase 3 | Text in → embedding vector(s) out |
+| `POST /generate` | Phase 3 | Prompt in → raw LLM completion out |
+| `POST /retrieve` | Phase 4 | `query` + `allowed_document_ids` → ranked `chunk_id`s (+ scores) |
+| `POST /rag/query` | Phase 5 | `question` + `allowed_document_ids` → grounded `answer` + `used_chunk_ids` + `no_context_found` |
+| `POST /index` | Phase 5.5 | `chunks` (`{chunk_id, document_id, content}`) → embeds each + writes the `vector_store` row; returns `indexed` count. The gateway also **creates the `vector_store` table + HNSW index on startup** |
+
+Every endpoint that accepts `allowed_document_ids` treats it as already computed by Java; every returned `chunk_id` is re-verified by Java before it is trusted (the rule above).
 
 ---
 
@@ -356,7 +385,7 @@ cp .env.example .env
 ./mvnw spring-boot:run
 ```
 
-On first run, Spring AI downloads and caches the local embedding model (`all-MiniLM-L6-v2`), and Hibernate + Spring AI create the schema (`document_chunks`, `vector_store`, etc.) automatically.
+On first run, Hibernate creates the relational schema (`document_chunks`, `users`, etc.) and the Python gateway creates the `vector_store` table + HNSW index on startup. The gateway's container image already bundles the embedding model (`all-MiniLM-L6-v2`), so no model download happens at runtime.
 
 ### 4. Verify & use
 

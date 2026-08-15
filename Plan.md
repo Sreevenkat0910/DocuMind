@@ -168,6 +168,7 @@ Each phase below is designed to be buildable and demo-able **on its own**, with 
 
 ### Phase 6 — RAG quality improvements (Python-native strengths)
 
+
 **Goal:** Now that Python owns retrieval end-to-end, use this phase to fix the things naive fixed-window chunking and pure vector search leave on the table — this maps to your existing roadmap Phase 3 ("smarter chunking") but is naturally a Python job.
 
 **Scope:**

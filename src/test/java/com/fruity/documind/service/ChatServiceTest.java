@@ -56,29 +56,46 @@ class ChatServiceTest {
     }
 
     @Test
-    void grounded_callsLlm_persistsBothTurns_andRecordsCitations() {
-        when(chunkRetrievalService.retrieve(anyString(), any(), anyInt()))
+    void grounded_callsGateway_reVerifies_persistsBothTurns_andRecordsCitations() {
+        when(chunkRetrievalService.accessibleDocumentIds(any())).thenReturn(List.of(UUID.randomUUID()));
+        when(gatewayClient.ragQuery(anyString(), anyList(), anyInt()))
+                .thenReturn(new GatewayClient.RagResult(
+                        "You get 20 days [1].", List.of(UUID.randomUUID().toString()), false));
+        when(chunkRetrievalService.verify(anyList(), any()))
                 .thenReturn(List.of(chunk("Handbook", 3, "Vacation is 20 days.")));
-        when(gatewayClient.generate(anyString(), anyString())).thenReturn("You get 20 days [1].");
 
         ChatResult result = service.ask("How much vacation?", null, user);
 
         assertEquals("You get 20 days [1].", result.answer());
-        verify(gatewayClient, times(1)).generate(anyString(), anyString());
-        verify(messageRepository, times(2)).save(any(Message.class)); // USER + ASSISTANT
+        verify(gatewayClient, times(1)).ragQuery(anyString(), anyList(), anyInt());
+        verify(chunkRetrievalService, times(1)).verify(anyList(), any()); // re-verification always runs
+        verify(messageRepository, times(2)).save(any(Message.class));     // USER + ASSISTANT
         verify(citationService, times(1)).recordCitations(any(), anyList());
     }
 
     @Test
-    void noAuthorizedChunks_skipsLlm_returnsCannedAnswer_noCitations() {
-        when(chunkRetrievalService.retrieve(anyString(), any(), anyInt())).thenReturn(List.of());
+    void noAccessibleDocs_skipsGateway_returnsCannedAnswer_noCitations() {
+        when(chunkRetrievalService.accessibleDocumentIds(any())).thenReturn(List.of());
 
         ChatResult result = service.ask("Anything secret?", null, user);
 
         assertTrue(result.answer().toLowerCase().contains("couldn't find"));
-        verify(gatewayClient, never()).generate(anyString(), anyString());
+        verify(gatewayClient, never()).ragQuery(anyString(), anyList(), anyInt());
         verify(citationService, never()).recordCitations(any(), anyList());
         verify(messageRepository, times(2)).save(any(Message.class)); // USER + canned ASSISTANT
+    }
+
+    @Test
+    void gatewayReportsNoContext_returnsCannedAnswer_skipsReVerify_noCitations() {
+        when(chunkRetrievalService.accessibleDocumentIds(any())).thenReturn(List.of(UUID.randomUUID()));
+        when(gatewayClient.ragQuery(anyString(), anyList(), anyInt()))
+                .thenReturn(new GatewayClient.RagResult("", List.of(), true));
+
+        ChatResult result = service.ask("Anything?", null, user);
+
+        assertTrue(result.answer().toLowerCase().contains("couldn't find"));
+        verify(chunkRetrievalService, never()).verify(anyList(), any());
+        verify(citationService, never()).recordCitations(any(), anyList());
     }
 
     @Test

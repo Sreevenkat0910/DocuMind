@@ -12,6 +12,7 @@ import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.font.PDType1Font;
 import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -21,20 +22,20 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.io.ByteArrayOutputStream;
 import java.util.List;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Full-pipeline integration test against the real pgvector database, using the REAL local
- * transformers embedding model (no API key, no network after the model is cached). Proves
- * storage → parse → chunk → JPA persistence → real embedding → vector-store insert.
+ * Full-pipeline integration test against the real pgvector database. Proves storage → parse →
+ * chunk → JPA persistence → gateway {@code POST /index} (embed + vector-store insert). Requires
+ * the gateway (:8000) and pgvector to be up.
  *
- * <p>{@code @Transactional} rolls all writes back, leaving the dev DB clean. A dummy OpenAI
- * key is set only so the (unused-here) Gemini chat bean can construct at context load.
+ * <p>{@code @Transactional} rolls the JPA writes (document, chunks) back. The vector rows, though,
+ * are committed by the Python gateway on its own connection and do NOT roll back — so
+ * {@code @AfterEach} deletes them explicitly to keep the dev DB clean (Phase 5.5).
  */
-@SpringBootTest(properties = {
-        "spring.ai.openai.api-key=sk-test-not-used",
-        "documind.gateway.enabled=false"})
+@SpringBootTest
 @Transactional
 class DocumentIngestionIntegrationTest {
 
@@ -47,6 +48,23 @@ class DocumentIngestionIntegrationTest {
     @Autowired
     private UserRepository userRepository;
 
+    private UUID indexedDocId; // vector rows the gateway committed out-of-band; cleaned up below
+
+    @AfterEach
+    void deleteCommittedVectors() throws Exception {
+        if (indexedDocId == null) {
+            return;
+        }
+        // Python committed these vector rows on its own connection, so a delete inside this
+        // test's (rolled-back) transaction wouldn't stick. Use a fresh auto-commit connection.
+        try (var conn = jdbcTemplate.getDataSource().getConnection();
+             var ps = conn.prepareStatement(
+                     "delete from vector_store where metadata->>'documentId' = ?")) {
+            ps.setString(1, indexedDocId.toString());
+            ps.executeUpdate();
+        }
+    }
+
     @Test
     void upload_runsFullPipeline_persistingChunksAndVectors() throws Exception {
         User uploader = persistUser();
@@ -54,6 +72,7 @@ class DocumentIngestionIntegrationTest {
                 "file", "integration.pdf", "application/pdf", singlePagePdf());
 
         Document doc = documentService.upload(file, "Integration Test Doc", uploader);
+        indexedDocId = doc.getId();
 
         // 1. Status lifecycle reached INDEXED.
         assertEquals(DocumentStatus.INDEXED, doc.getStatus());

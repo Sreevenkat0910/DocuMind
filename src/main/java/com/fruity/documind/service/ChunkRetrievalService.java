@@ -5,9 +5,6 @@ import com.fruity.documind.entity.User;
 import com.fruity.documind.gateway.GatewayClient;
 import com.fruity.documind.repository.DocumentChunkRepository;
 import com.fruity.documind.repository.DocumentPermissionRepository;
-import org.springframework.ai.vectorstore.SearchRequest;
-import org.springframework.ai.vectorstore.VectorStore;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -31,30 +28,23 @@ import java.util.stream.Collectors;
  * gate: a permission revoked after the pre-filter was computed still blocks the
  * chunk here.
  *
- * <p><b>Phase 4:</b> the similarity search itself moves to the Python gateway
- * ({@code POST /retrieve}) when {@code documind.gateway.enabled=true}; otherwise the
- * local Spring AI {@link VectorStore} does it in-process. Either way the re-verification
- * gate below is unchanged — the gateway is trusted to <em>filter</em>, never to <em>authorize</em>.
+ * <p>Similarity search runs entirely in the Python gateway ({@code POST /retrieve} and
+ * {@code /rag/query}); Java holds no vector-store code. The re-verification gate below is
+ * unchanged — the gateway is trusted to <em>filter</em>, never to <em>authorize</em>.
  */
 @Service
 public class ChunkRetrievalService {
 
-    private final VectorStore vectorStore;
     private final GatewayClient gatewayClient;
     private final DocumentChunkRepository chunkRepository;
     private final DocumentPermissionRepository permissionRepository;
-    private final boolean gatewayEnabled;
 
-    public ChunkRetrievalService(VectorStore vectorStore,
-                                 GatewayClient gatewayClient,
+    public ChunkRetrievalService(GatewayClient gatewayClient,
                                  DocumentChunkRepository chunkRepository,
-                                 DocumentPermissionRepository permissionRepository,
-                                 @Value("${documind.gateway.enabled:false}") boolean gatewayEnabled) {
-        this.vectorStore = vectorStore;
+                                 DocumentPermissionRepository permissionRepository) {
         this.gatewayClient = gatewayClient;
         this.chunkRepository = chunkRepository;
         this.permissionRepository = permissionRepository;
-        this.gatewayEnabled = gatewayEnabled;
     }
 
     /** A chunk that passed the authorization gate, with its similarity score. */
@@ -73,11 +63,9 @@ public class ChunkRetrievalService {
             return List.of(); // user can see nothing; skip the vector search entirely.
         }
 
-        // --- Step 3: similarity search (Python gateway or local VectorStore), pre-filtered
-        //     by the allowed document ids. Returns chunkId -> score in similarity order. ---
-        Map<UUID, Double> scoreByChunkId = gatewayEnabled
-                ? candidatesViaGateway(query, allowedDocIds, topK)
-                : candidatesViaVectorStore(query, allowedDocIds, topK);
+        // --- Step 3: similarity search in the Python gateway, pre-filtered by the allowed
+        //     document ids. Returns chunkId -> score in similarity order. ---
+        Map<UUID, Double> scoreByChunkId = candidatesViaGateway(query, allowedDocIds, topK);
         if (scoreByChunkId.isEmpty()) {
             return List.of();
         }
@@ -107,6 +95,46 @@ public class ChunkRetrievalService {
         return result;
     }
 
+    /**
+     * The document ids {@code user} is currently authorized to see. Phase 5 sends this to the
+     * Python gateway as the retrieval pre-filter; it is NOT the final authorization decision.
+     */
+    @Transactional(readOnly = true)
+    public List<UUID> accessibleDocumentIds(User user) {
+        return permissionRepository.findAccessibleDocumentIds(user.getId(), user.getRole());
+    }
+
+    /**
+     * Phase 5 re-verification gate: given chunk ids from an untrusted source (the Python
+     * {@code /rag/query} response), return only the chunks whose parent document {@code user}
+     * is authorized to see <em>right now</em>, in the given order. A forged/unknown id (no such
+     * chunk) or an unauthorized one (permission revoked, or never granted) is silently dropped.
+     * This is the same guarantee as {@link #retrieve}, applied to ids that arrived over HTTP.
+     */
+    @Transactional(readOnly = true)
+    public List<RetrievedChunk> verify(List<UUID> chunkIds, User user) {
+        if (chunkIds.isEmpty()) {
+            return List.of();
+        }
+        Map<UUID, DocumentChunk> chunkById = chunkRepository.findAllByIdInWithDocument(chunkIds).stream()
+                .collect(Collectors.toMap(DocumentChunk::getId, c -> c));
+        Set<UUID> allowedNow = new HashSet<>(
+                permissionRepository.findAccessibleDocumentIds(user.getId(), user.getRole()));
+
+        List<RetrievedChunk> verified = new ArrayList<>(chunkIds.size());
+        for (UUID id : chunkIds) {
+            DocumentChunk chunk = chunkById.get(id);
+            if (chunk == null) {
+                continue; // forged or deleted chunk id: never trust it.
+            }
+            if (!allowedNow.contains(chunk.getDocument().getId())) {
+                continue; // not authorized (or revoked since retrieval): block it.
+            }
+            verified.add(new RetrievedChunk(chunk, null)); // score not carried by used_chunk_ids
+        }
+        return verified;
+    }
+
     /** Phase 4: vector search delegated to the Python gateway's {@code /retrieve}. */
     private Map<UUID, Double> candidatesViaGateway(String query, List<UUID> allowedDocIds, int topK) {
         List<String> allowed = allowedDocIds.stream().map(UUID::toString).toList();
@@ -119,37 +147,6 @@ public class ChunkRetrievalService {
                 scoreByChunkId.put(UUID.fromString(ref.chunkId()), ref.score());
             } catch (IllegalArgumentException ignored) {
                 // Malformed chunk id from the gateway: ignore rather than trust it.
-            }
-        }
-        return scoreByChunkId;
-    }
-
-    /** Pre-Phase-4 local path: Spring AI {@link VectorStore} does the search in-process. */
-    private Map<UUID, Double> candidatesViaVectorStore(String query, List<UUID> allowedDocIds, int topK) {
-        String inList = allowedDocIds.stream()
-                .map(id -> "'" + id + "'")
-                .collect(Collectors.joining(", ", "documentId in [", "]"));
-
-        SearchRequest request = SearchRequest.builder()
-                .query(query)
-                .topK(topK)
-                .filterExpression(inList)
-                .build();
-
-        List<org.springframework.ai.document.Document> hits = vectorStore.similaritySearch(request);
-        Map<UUID, Double> scoreByChunkId = new LinkedHashMap<>();
-        if (hits == null) {
-            return scoreByChunkId;
-        }
-        for (org.springframework.ai.document.Document hit : hits) {
-            Object raw = hit.getMetadata().get(ChunkIngestionService.META_CHUNK_ID);
-            if (raw == null) {
-                continue; // vector rows written outside our ingestion path have no chunkId.
-            }
-            try {
-                scoreByChunkId.put(UUID.fromString(raw.toString()), hit.getScore());
-            } catch (IllegalArgumentException ignored) {
-                // Malformed metadata: ignore rather than trust it.
             }
         }
         return scoreByChunkId;

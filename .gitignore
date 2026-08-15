@@ -37,3 +37,12 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Java language-server output (VS Code JDT reimport) ###
+bin/
+
+### Python ###
+__pycache__/
+
+### Serena MCP tool cache ###
+.serena/

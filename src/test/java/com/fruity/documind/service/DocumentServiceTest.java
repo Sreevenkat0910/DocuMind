@@ -3,9 +3,9 @@ package com.fruity.documind.service;
 import com.fruity.documind.entity.Document;
 import com.fruity.documind.entity.User;
 import com.fruity.documind.enums.DocumentStatus;
+import com.fruity.documind.gateway.GatewayClient;
 import com.fruity.documind.repository.DocumentPermissionRepository;
 import com.fruity.documind.repository.DocumentRepository;
-import com.fruity.documind.service.ChunkIngestionService.ChunkInput;
 import com.fruity.documind.service.PdfParsingService.ParsedDocument;
 import com.fruity.documind.service.PdfParsingService.ParsedPage;
 import org.junit.jupiter.api.BeforeEach;
@@ -28,7 +28,7 @@ class DocumentServiceTest {
     private DocumentPermissionRepository documentPermissionRepository;
     private FileStorageService fileStorageService;
     private PdfParsingService pdfParsingService;
-    private ChunkingService chunkingService;
+    private GatewayClient gatewayClient;
     private ChunkIngestionService chunkIngestionService;
     private DocumentService service;
     private User uploader;
@@ -39,10 +39,10 @@ class DocumentServiceTest {
         documentPermissionRepository = mock(DocumentPermissionRepository.class);
         fileStorageService = mock(FileStorageService.class);
         pdfParsingService = mock(PdfParsingService.class);
-        chunkingService = mock(ChunkingService.class);
+        gatewayClient = mock(GatewayClient.class);
         chunkIngestionService = mock(ChunkIngestionService.class);
         service = new DocumentService(documentRepository, documentPermissionRepository,
-                fileStorageService, pdfParsingService, chunkingService, chunkIngestionService);
+                fileStorageService, pdfParsingService, gatewayClient, chunkIngestionService);
         uploader = new User();
 
         // save() returns its argument (the same mutated Document instance) back.
@@ -58,8 +58,8 @@ class DocumentServiceTest {
     void happyPath_marksIndexed_andIngestsChunks() throws Exception {
         when(pdfParsingService.parse(any(byte[].class)))
                 .thenReturn(new ParsedDocument(2, List.of(new ParsedPage(1, "a"), new ParsedPage(2, "b"))));
-        when(chunkingService.chunk(any()))
-                .thenReturn(List.of(new ChunkInput(0, "a", 1, 1), new ChunkInput(1, "b", 2, 1)));
+        when(gatewayClient.chunk(any()))
+                .thenReturn(List.of(new GatewayClient.ChunkOutput("a", 1), new GatewayClient.ChunkOutput("b", 2)));
 
         Document result = service.upload(pdf(), "My Title", uploader);
 
@@ -77,7 +77,7 @@ class DocumentServiceTest {
     void scannedPdf_zeroChunks_stillIndexed_butSkipsIngest() throws Exception {
         when(pdfParsingService.parse(any(byte[].class)))
                 .thenReturn(new ParsedDocument(1, List.of(new ParsedPage(1, ""))));
-        when(chunkingService.chunk(any())).thenReturn(List.of()); // no extractable text
+        when(gatewayClient.chunk(any())).thenReturn(List.of()); // no extractable text
 
         Document result = service.upload(pdf(), null, uploader);
 

@@ -1,0 +1,24 @@
+[
+  {"question": "Which historical agreement dealing with tidal-lattice synchronization was ratified in 1847?", "expected_doc": "zephyr"},
+  {"question": "Who authored the Zephyr Protocol?", "expected_doc": "zephyr"},
+
+  {"question": "What year was the seismic-lattice calibration accord ratified, and by whom?", "expected_doc": "solandra"},
+  {"question": "Who authored the Solandra Accord?", "expected_doc": "solandra"},
+
+  {"question": "Which agreement governs magneto-lattice resonance in the eastern provinces?", "expected_doc": "kestrelmoor"},
+  {"question": "Who is the lead author of the Kestrelmoor Concord?", "expected_doc": "kestrelmoor"},
+
+  {"question": "What penalty applies for skipping the required coolant reservoir audits?", "expected_doc": "harrowgate"},
+  {"question": "Who issued Bulletin HG-4471?", "expected_doc": "harrowgate"},
+
+  {"question": "How much is the fine for missing a ballast tank inspection at the shipping yard?", "expected_doc": "coldstream"},
+  {"question": "What directive requires monthly ballast tank inspections?", "expected_doc": "coldstream"},
+
+  {"question": "What is the penalty amount for non-compliance with the ventilation shaft inspection notice?", "expected_doc": "millbrook"},
+  {"question": "Who issued Notice ML-2290?", "expected_doc": "millbrook"},
+
+  {"question": "How many paid leave days does a new employee at the robotics company get?", "expected_doc": "fennwick"},
+
+  {"question": "What signing stipend do new hires receive at the systems company, and how long until badge access?", "expected_doc": "draymoor"},
+  {"question": "Who is the onboarding lead at Draymoor Systems?", "expected_doc": "draymoor"}
+]
